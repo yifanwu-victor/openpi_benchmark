@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -227,11 +228,25 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    if (
+        config.wandb_enabled
+        and os.environ.get("WANDB_MODE", "").lower() != "disabled"
+        and os.environ.get("OPENPI_SKIP_WANDB_IMAGES", "0") != "1"
+    ):
+        try:
+            images = jax.device_get(batch[0].images)
+            image_keys = [key for key in getattr(config.model, "image_keys", tuple(images)) if key in images]
+            image_keys.extend(key for key in images if key not in image_keys)
+            images_to_log = [
+                wandb.Image(
+                    np.concatenate([np.asarray(images[key][i]) for key in image_keys], axis=1),
+                    caption=" | ".join(image_keys),
+                )
+                for i in range(min(5, len(next(iter(images.values())))))
+            ]
+            wandb.log({"camera_views": images_to_log}, step=0)
+        except Exception:
+            logging.exception("Failed to log camera views to wandb; continuing training without image logging.")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)

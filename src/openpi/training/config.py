@@ -19,8 +19,10 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.insert_usb_vision_policy as insert_usb_vision_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -356,6 +358,76 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotInsertUsbVisionDataConfig(DataConfigFactory):
+    """Data config for UniVTAC real Insert USB, vision-only absolute EEF actions."""
+
+    default_prompt: str | None = "pick and insert the USB"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+        }
+        if (self.base_config or DataConfig()).prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+
+        data_transforms = _transforms.Group(
+            inputs=[insert_usb_vision_policy.InsertUsbVisionInputs(model_type=model_config.model_type)],
+            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs()],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotInsertUsbVisionTactileDataConfig(DataConfigFactory):
+    """Data config for UniVTAC real Insert USB, using visual and tactile image observations."""
+
+    default_prompt: str | None = (
+        "remove the red USB from the blue holder and insert it into the leftmost black USB slot"
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/left_tactile_image": "left_tactile_image",
+            "observation/right_tactile_image": "right_tactile_image",
+            "observation/state": "state",
+            "actions": "actions",
+        }
+        if (self.base_config or DataConfig()).prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+
+        data_transforms = _transforms.Group(
+            inputs=[insert_usb_vision_policy.InsertUsbVisionTactileInputs(model_type=model_config.model_type)],
+            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs()],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -503,7 +575,7 @@ class TrainConfig:
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 16
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -716,7 +788,7 @@ _CONFIGS = [
         ),
         # Note that we load the pi0-FAST base model checkpoint here.
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi0_fast_libero_low_mem_finetune",
@@ -760,6 +832,208 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_real_abs_eef_vision"),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_real_abs_eef_vision"),
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_abs_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_sim_abs_eef",
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision_action_expert_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_real_abs_eef_vision"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=100_000,
+            decay_lr=2e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        # Freeze the frozen perception/language prefix, but train the action expert and action projection heads.
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision_tactile_action_expert_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_real_abs_eef_vision"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=100_000,
+            decay_lr=2e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        # Freeze the frozen perception/language prefix, but train the action expert and action projection heads.
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
     ),
     #
     # Fine-tuning Aloha configs.
