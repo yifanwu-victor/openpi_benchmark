@@ -49,13 +49,19 @@ def create_trained_policy(
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
 
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if data_config.prompt_required and default_prompt is not None:
+        raise ValueError(
+            "This policy requires every inference observation to include a top-level 'prompt'. "
+            "Do not pass default_prompt when creating it."
+        )
+
     logging.info("Loading model...")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
@@ -72,11 +78,13 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    default_prompt_transforms = [] if data_config.prompt_required else [transforms.InjectDefaultPrompt(default_prompt)]
+
     return _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
-            transforms.InjectDefaultPrompt(default_prompt),
+            *default_prompt_transforms,
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

@@ -9,14 +9,14 @@ Recommended usage from the OpenPI repo root:
 
     uv run examples/insert_usb/convert_insert_usb_real_to_lerobot.py \
         --raw-dir /shareNFS_40/wyf/UniVTAC/data/real/raw/insert_USB_real \
-        --repo-id wyf/insert_usb_real_abs_eef \
+        --repo-id wyf/insert_usb_new_real_abs_eef \
         --output-root /shareNFS_40/wyf/data/lerobot \
         --image-size 224 224 \
         --overwrite
 
 Default output:
 
-    /shareNFS_40/wyf/data/lerobot/wyf/insert_usb_real_abs_eef
+    /shareNFS_40/wyf/data/lerobot/wyf/insert_usb_new_real_abs_eef
 
 The LeRobot dataset stores one action per frame. OpenPI later builds action
 chunks automatically with `delta_timestamps` according to the training config's
@@ -51,8 +51,10 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_RAW_DIR = Path("/shareNFS_40/wyf/UniVTAC/data/real/raw/insert_USB_real")
 DEFAULT_OUTPUT_ROOT = Path("/shareNFS_40/wyf/data/lerobot")
-DEFAULT_REPO_ID = "wyf/insert_usb_real_abs_eef"
-DEFAULT_TASK_PROMPT = "remove the red USB from the blue holder and insert it into the leftmost black USB slot"
+DEFAULT_REPO_ID = "wyf/insert_usb_new_real_abs_eef"
+DEFAULT_TASK_PROMPT = "pick and insert the USB"
+DEFAULT_EPISODE_START = 1
+DEFAULT_EPISODE_END = 80
 DEFAULT_FPS = 20
 DEFAULT_IMAGE_SIZE = (224, 224)
 
@@ -100,6 +102,24 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Optional raw episode ids to convert, e.g. 000000 000001.",
+    )
+    parser.add_argument(
+        "--episode-start",
+        type=int,
+        default=DEFAULT_EPISODE_START,
+        help=(
+            "First raw numeric episode id to convert, inclusive. Ignored when --episode-ids is set. "
+            f"Default: {DEFAULT_EPISODE_START}."
+        ),
+    )
+    parser.add_argument(
+        "--episode-end",
+        type=int,
+        default=DEFAULT_EPISODE_END,
+        help=(
+            "Last raw numeric episode id to convert, inclusive. Ignored when --episode-ids is set. "
+            f"Default: {DEFAULT_EPISODE_END}."
+        ),
     )
     parser.add_argument(
         "--max-episodes",
@@ -187,6 +207,18 @@ def sorted_episode_dirs(raw_dir: Path, episode_ids: list[str] | None) -> list[Pa
     if not episodes:
         raise FileNotFoundError(f"No episode directories found in {raw_dir}")
     return episodes
+
+
+def filter_episode_range(episodes: list[Path], start: int, end: int) -> list[Path]:
+    if start < 0 or end < 0:
+        raise ValueError(f"Episode range must be non-negative, got {start}-{end}")
+    if start > end:
+        raise ValueError(f"--episode-start must be <= --episode-end, got {start}>{end}")
+
+    filtered = [path for path in episodes if start <= int(path.name) <= end]
+    if not filtered:
+        raise FileNotFoundError(f"No episode directories found in requested numeric range {start}-{end}")
+    return filtered
 
 
 def sorted_jpgs(image_dir: Path) -> list[Path]:
@@ -297,7 +329,7 @@ def infer_fps(states: dict[str, np.ndarray], selected_indices: np.ndarray, fallb
     if len(deltas) == 0:
         return fallback
 
-    fps = int(round(1.0 / float(np.median(deltas))))
+    fps = round(1.0 / float(np.median(deltas)))
     return max(1, fps)
 
 
@@ -383,6 +415,8 @@ def main() -> None:
         raise FileNotFoundError(f"Missing raw directory: {raw_dir}")
 
     episodes = sorted_episode_dirs(raw_dir, args.episode_ids)
+    if args.episode_ids is None:
+        episodes = filter_episode_range(episodes, args.episode_start, args.episode_end)
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
 
@@ -393,7 +427,9 @@ def main() -> None:
 
     print(f"Raw dir: {raw_dir}")
     print(f"Episodes: {len(episodes)}")
+    print(f"Episode ids: {episodes[0].name}..{episodes[-1].name}")
     print(f"Repo id: {args.repo_id}")
+    print(f"Task prompt: {args.task_prompt!r}")
     print(f"Output dataset root: {dataset_root}")
     print(f"FPS: {fps}")
     print(f"Frame stride: {args.frame_stride}")

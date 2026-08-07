@@ -1,8 +1,10 @@
+# ruff: noqa: UP007
 import collections
 import dataclasses
 import logging
 import math
 import pathlib
+from typing import Optional
 
 import imageio
 from libero.libero import benchmark
@@ -34,6 +36,8 @@ class Args:
     task_suite_name: str = (
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
+    # If set, evaluate only this task id in the selected suite.
+    task_id: Optional[int] = None
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
@@ -74,7 +78,14 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    if args.task_id is not None:
+        if args.task_id < 0 or args.task_id >= num_tasks_in_suite:
+            raise ValueError(f"Task id {args.task_id} is out of range for {args.task_suite_name} ({num_tasks_in_suite})")
+        task_ids = [args.task_id]
+    else:
+        task_ids = list(range(num_tasks_in_suite))
+
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -168,7 +179,7 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                pathlib.Path(args.video_out_path) / f"rollout_task{task_id:02d}_ep{episode_idx:03d}_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )

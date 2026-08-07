@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.insert_usb_vision_policy as insert_usb_vision_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.sim_policy as sim_policy
 import openpi.shared.download as _download
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
@@ -91,6 +92,8 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # If true, serving requires the client to send a top-level "prompt" field.
+    prompt_required: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -359,9 +362,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotInsertUsbVisionDataConfig(DataConfigFactory):
-    """Data config for UniVTAC real Insert USB, vision-only absolute EEF actions."""
+    """Data config for UniVTAC Insert USB, vision-only actions."""
 
     default_prompt: str | None = "pick and insert the USB"
+    output_action_dim: int = insert_usb_vision_policy.ABS_EEF_ACTION_DIM
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -378,7 +382,7 @@ class LeRobotInsertUsbVisionDataConfig(DataConfigFactory):
 
         data_transforms = _transforms.Group(
             inputs=[insert_usb_vision_policy.InsertUsbVisionInputs(model_type=model_config.model_type)],
-            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs()],
+            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs(action_dim=self.output_action_dim)],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -392,11 +396,12 @@ class LeRobotInsertUsbVisionDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotInsertUsbVisionTactileDataConfig(DataConfigFactory):
-    """Data config for UniVTAC real Insert USB, using visual and tactile image observations."""
+    """Data config for UniVTAC Insert USB, using visual and tactile image observations."""
 
     default_prompt: str | None = (
         "remove the red USB from the blue holder and insert it into the leftmost black USB slot"
     )
+    output_action_dim: int = insert_usb_vision_policy.ABS_EEF_ACTION_DIM
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -415,7 +420,7 @@ class LeRobotInsertUsbVisionTactileDataConfig(DataConfigFactory):
 
         data_transforms = _transforms.Group(
             inputs=[insert_usb_vision_policy.InsertUsbVisionTactileInputs(model_type=model_config.model_type)],
-            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs()],
+            outputs=[insert_usb_vision_policy.InsertUsbVisionOutputs(action_dim=self.output_action_dim)],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -424,6 +429,92 @@ class LeRobotInsertUsbVisionTactileDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSimVisionDataConfig(DataConfigFactory):
+    """Data config for UniVTAC sim policies with two RGB observations."""
+
+    state_dim: int | None = None
+    output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        if not base_config.prompt_from_task:
+            raise ValueError("LeRobotSimVisionDataConfig requires base_config=DataConfig(prompt_from_task=True).")
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[sim_policy.SimVisionInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
+            outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=None)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_required=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSimVisionTactileDataConfig(DataConfigFactory):
+    """Data config for UniVTAC sim policies with RGB and tactile observations."""
+
+    state_dim: int | None = None
+    output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        if not base_config.prompt_from_task:
+            raise ValueError(
+                "LeRobotSimVisionTactileDataConfig requires base_config=DataConfig(prompt_from_task=True)."
+            )
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/left_tactile_image": "left_tactile_image",
+                        "observation/right_tactile_image": "right_tactile_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[sim_policy.SimVisionTactileInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
+            outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=None)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_required=True,
         )
 
 
@@ -585,9 +676,9 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 20000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 20000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -834,6 +925,42 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        name="pi05_libero_task0_lora_debug",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="wyf/libero_task0_debug",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=1_000,
+        log_interval=10,
+        save_interval=500,
+        keep_period=None,
+    ),
+    TrainConfig(
         name="pi05_insert_usb_real_abs_eef_vision",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -894,6 +1021,105 @@ _CONFIGS = [
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_real_abs_eef_vision_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_real_abs_eef",
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_new_real_abs_eef_vision_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_new_real_abs_eef",
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_new_real_abs_eef_vision_tactile_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/insert_usb_new_real_abs_eef",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
         ).get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
@@ -965,6 +1191,704 @@ _CONFIGS = [
         ).get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_abs_joint_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_sim_abs_joint",
+            base_config=DataConfig(prompt_from_task=False),
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_abs_joint_vision_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/insert_usb_sim_abs_joint",
+            base_config=DataConfig(prompt_from_task=False),
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_delta_eef_vision_full_ft_h50_jax",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="simulation/insert_usb_sim_delta_eef",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+            output_action_dim=insert_usb_vision_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        fsdp_devices=2,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_delta_eef_vision_tactile_full_ft_h50_jax",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="simulation/insert_usb_sim_delta_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_sim_delta_eef_vision_full_ft_h50_jax"),
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+            output_action_dim=insert_usb_vision_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        fsdp_devices=2,
+    ),
+    TrainConfig(
+        name="pi05_insert_block_sim_delta_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_block_gelsight_delta_eef",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_block_sim_delta_eef_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/insert_block_gelsight_delta_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_block_sim_delta_eef_vision_lora"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_pull_drawer_sim_delta_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/pull_drawer_gelsight_delta_eef",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_pull_drawer_sim_delta_eef_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/pull_drawer_gelsight_delta_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_pull_drawer_sim_delta_eef_vision_lora"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_gelsight_sim_delta_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_usb_gelsight_delta_eef",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_gelsight_sim_delta_eef_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/insert_usb_gelsight_delta_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_gelsight_sim_delta_eef_vision_lora"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_place_cube_on_colored_area_gelsight_sim_delta_eef_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/place_cube_on_colored_area_gelsight_delta_eef",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_place_cube_on_colored_area_gelsight_sim_delta_eef_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/place_cube_on_colored_area_gelsight_delta_eef",
+            assets=AssetsConfig(assets_dir="./assets/pi05_place_cube_on_colored_area_gelsight_sim_delta_eef_vision_lora"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_EEF_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_neosim_insert_usb_abs_eef_vision_tactile_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="neosim/insert_usb_abs_eef",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_EEF_STATE_DIM,
+            output_action_dim=sim_policy.ABS_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_neosim_insert_usb_abs_joint_vision_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="neosim/insert_usb_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_swap_cup_order_sim_abs_joint_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/swap_cup_order_sim_abs_joint",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="swap the cup order",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_swap_cup_order_sim_abs_joint_vision_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertUsbVisionDataConfig(
+            repo_id="wyf/swap_cup_order_sim_abs_joint",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="swap the cup order",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_swap_cup_order_sim_abs_joint_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/swap_cup_order_sim_abs_joint",
+            assets=AssetsConfig(assets_dir="./assets/pi05_swap_cup_order_sim_abs_joint_vision_lora"),
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="swap the cup order",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_swap_cup_order_sim_abs_joint_vision_tactile_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/swap_cup_order_sim_abs_joint",
+            assets=AssetsConfig(assets_dir="./assets/pi05_swap_cup_order_sim_abs_joint_vision_lora_h50"),
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="swap the cup order",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_abs_joint_vision_tactile_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/insert_usb_sim_abs_joint",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_sim_abs_joint_vision_tactile_lora_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ),
+        data=LeRobotInsertUsbVisionTactileDataConfig(
+            repo_id="wyf/insert_usb_sim_abs_joint",
+            assets=AssetsConfig(assets_dir="./assets/pi05_insert_usb_sim_abs_joint_vision_lora_h50"),
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick and insert the USB",
+            output_action_dim=insert_usb_vision_policy.ABS_JOINT_ACTION_DIM,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=insert_usb_vision_policy.VISION_TACTILE_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi05_insert_usb_real_abs_eef_vision_action_expert_ft",

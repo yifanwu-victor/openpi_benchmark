@@ -38,15 +38,15 @@ from openpi.policies import policy_config
 from openpi.training import config as training_config
 
 
-DEFAULT_CONFIG_NAME = "pi05_insert_usb_real_abs_eef_vision_lora_single_gpu"
+DEFAULT_CONFIG_NAME = "pi05_insert_usb_real_abs_eef_vision_lora"
 DEFAULT_CHECKPOINT_DIR = Path(
     "/shareNFS_40/wyf/workplace/openpi/checkpoints/"
-    "pi05_insert_usb_real_abs_eef_vision_lora_single_gpu/"
-    "insert_usb_lora_single_gpu_v1/20000"
+    "pi05_insert_usb_real_abs_eef_vision_lora/"
+    "insert_usb_vision_lora_v1/29999"
 )
 DEFAULT_DATASET_DIR = Path("/shareNFS_40/wyf/data/lerobot/wyf/insert_usb_real_abs_eef")
-DEFAULT_OUTPUT_DIR = Path("outputs/insert_usb_vis/lora_20000_ep0")
-DEFAULT_PROMPT = "remove the red USB from the blue holder and insert it into the leftmost black USB slot"
+DEFAULT_OUTPUT_DIR = Path("outputs/insert_usb_vis/lora_29999_ep0")
+DEFAULT_PROMPT = "pick and insert the USB"
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,6 +134,9 @@ def main() -> None:
     pred_xyz_chunks = []
     gt_xyz_chunks = []
     state_xyz_chunks = []
+    pred_gripper_chunks = []
+    gt_gripper_chunks = []
+    state_gripper_chunks = []
     all_start_indices = []
     for chunk_idx, start in enumerate(starts):
         start = int(start)
@@ -158,6 +161,9 @@ def main() -> None:
         pred_xyz_chunks.append(pred_actions[: args.horizon, :3])
         gt_xyz_chunks.append(gt_actions[:, :3])
         state_xyz_chunks.append(states[:, :3])
+        pred_gripper_chunks.append(pred_actions[: args.horizon, 9])
+        gt_gripper_chunks.append(gt_actions[:, 9])
+        state_gripper_chunks.append(states[:, 9])
         all_start_indices.extend(range(start, start + args.horizon))
 
         if chunk_idx % 10 == 0 or chunk_idx == len(starts) - 1:
@@ -166,6 +172,9 @@ def main() -> None:
     pred_xyz = np.concatenate(pred_xyz_chunks, axis=0)
     gt_xyz = np.concatenate(gt_xyz_chunks, axis=0)
     state_xyz = np.concatenate(state_xyz_chunks, axis=0)
+    pred_gripper = np.concatenate(pred_gripper_chunks, axis=0)
+    gt_gripper = np.concatenate(gt_gripper_chunks, axis=0)
+    state_gripper = np.concatenate(state_gripper_chunks, axis=0)
     frame_indices = np.asarray(all_start_indices, dtype=np.int64)
     if pred_xyz.shape != gt_xyz.shape:
         raise RuntimeError(f"pred_xyz shape {pred_xyz.shape} does not match gt_xyz {gt_xyz.shape}")
@@ -174,6 +183,7 @@ def main() -> None:
     delta_pred = pred_xyz - state_xyz
     delta_gt = gt_xyz - state_xyz
     delta_error = np.linalg.norm(delta_pred - delta_gt, axis=1)
+    gripper_error = np.abs(pred_gripper - gt_gripper)
 
     summary = {
         "dataset_dir": str(dataset_dir),
@@ -190,10 +200,33 @@ def main() -> None:
         "xyz_error_max_m": float(np.max(xyz_error)),
         "delta_xyz_error_mean_m": float(np.mean(delta_error)),
         "delta_xyz_error_max_m": float(np.max(delta_error)),
+        "gripper_error_mean": float(np.mean(gripper_error)),
+        "gripper_error_max": float(np.max(gripper_error)),
     }
 
-    save_arrays(output_dir, frame_indices, pred_xyz, gt_xyz, state_xyz, xyz_error, delta_error)
-    plot_xyz_over_time(output_dir / "xyz_over_time.png", frame_indices, pred_xyz, gt_xyz, state_xyz)
+    save_arrays(
+        output_dir,
+        frame_indices,
+        pred_xyz,
+        gt_xyz,
+        state_xyz,
+        pred_gripper,
+        gt_gripper,
+        state_gripper,
+        xyz_error,
+        delta_error,
+        gripper_error,
+    )
+    plot_xyz_over_time(
+        output_dir / "xyz_over_time.png",
+        frame_indices,
+        pred_xyz,
+        gt_xyz,
+        state_xyz,
+        pred_gripper,
+        gt_gripper,
+        state_gripper,
+    )
     plot_xyz_3d(output_dir / "xyz_3d.png", pred_xyz, gt_xyz, state_xyz)
     plot_xyz_error(output_dir / "xyz_error.png", frame_indices, xyz_error, delta_error)
     save_input_preview(output_dir / "input_preview.png", df, starts[: min(8, len(starts))])
@@ -249,8 +282,12 @@ def save_arrays(
     pred_xyz: np.ndarray,
     gt_xyz: np.ndarray,
     state_xyz: np.ndarray,
+    pred_gripper: np.ndarray,
+    gt_gripper: np.ndarray,
+    state_gripper: np.ndarray,
     xyz_error: np.ndarray,
     delta_error: np.ndarray,
+    gripper_error: np.ndarray,
 ) -> None:
     np.savez(
         output_dir / "action_chunk_xyz_compare.npz",
@@ -258,8 +295,12 @@ def save_arrays(
         pred_xyz=pred_xyz,
         gt_xyz=gt_xyz,
         state_xyz=state_xyz,
+        pred_gripper=pred_gripper,
+        gt_gripper=gt_gripper,
+        state_gripper=state_gripper,
         xyz_error=xyz_error,
         delta_xyz_error=delta_error,
+        gripper_error=gripper_error,
     )
 
 
@@ -269,18 +310,27 @@ def plot_xyz_over_time(
     pred_xyz: np.ndarray,
     gt_xyz: np.ndarray,
     state_xyz: np.ndarray,
+    pred_gripper: np.ndarray,
+    gt_gripper: np.ndarray,
+    state_gripper: np.ndarray,
 ) -> None:
     labels = ("x", "y", "z")
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-    for dim, ax in enumerate(axes):
+    fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True)
+    for dim, ax in enumerate(axes[:3]):
         ax.plot(frame_indices, gt_xyz[:, dim], label="gt action xyz", linewidth=1.4)
         ax.plot(frame_indices, pred_xyz[:, dim], label="pred action xyz", linewidth=1.2, alpha=0.9)
         ax.plot(frame_indices, state_xyz[:, dim], label="state xyz", linewidth=0.9, alpha=0.6, linestyle="--")
         ax.set_ylabel(f"{labels[dim]} (m)")
         ax.grid(True, alpha=0.25)
+    axes[3].plot(frame_indices, gt_gripper, label="gt action gripper", linewidth=1.4)
+    axes[3].plot(frame_indices, pred_gripper, label="pred action gripper", linewidth=1.2, alpha=0.9)
+    axes[3].plot(frame_indices, state_gripper, label="state gripper", linewidth=0.9, alpha=0.6, linestyle="--")
+    axes[3].set_ylabel("gripper")
+    axes[3].grid(True, alpha=0.25)
     axes[-1].set_xlabel("frame index")
     axes[0].legend(loc="best")
-    fig.suptitle("Insert USB action chunk xyz targets")
+    axes[3].legend(loc="best")
+    fig.suptitle("Insert USB action chunk xyz and gripper targets")
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)

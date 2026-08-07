@@ -6,6 +6,48 @@ OpenPI training only imports `src/openpi/training/config.py` by default. Snapsho
 files here are not automatically used by `scripts/train.py`; they are for diffing,
 copying blocks back, or documenting previous experiment setups.
 
+## 2026-07-20: `pi05_swap_cup_order_sim_abs_joint_vision_lora`
+
+Snapshot file:
+
+- `config_swap_cup_order_sim_abs_joint_vision_lora_20260720.py`
+
+This records the active `config.py` state after adding the two-image simulated
+Swap Cup Order absolute-joint LoRA config, before adding the four-image tactile
+variant.
+
+Main setup:
+
+- Config name: `pi05_swap_cup_order_sim_abs_joint_vision_lora`
+- Dataset repo id: `wyf/swap_cup_order_sim_abs_joint`
+- Dataset root: `/shareNFS_40/wyf/data/lerobot/wyf/swap_cup_order_sim_abs_joint`
+- Prompt: `swap the cup order`
+- `prompt_from_task=False`
+- Raw state/action dimension: `8`
+- State/action meaning: `[7 Franka joints, 1 gripper]`
+- `action_horizon=20`
+- `batch_size=16`
+- `num_train_steps=30_000`
+- `paligemma_variant="gemma_2b_lora"`
+- `action_expert_variant="gemma_300m_lora"`
+
+Image inputs:
+
+- `base_0_rgb`: simulated head camera
+- `left_wrist_0_rgb`: simulated wrist camera
+- `right_wrist_0_rgb`: masked zero image placeholder
+
+Follow-up active config added after this snapshot:
+
+- `pi05_swap_cup_order_sim_abs_joint_vision_tactile_lora`
+  - Uses the same `wyf/swap_cup_order_sim_abs_joint` dataset.
+  - Reuses norm stats from
+    `./assets/pi05_swap_cup_order_sim_abs_joint_vision_lora`.
+  - Uses all four image inputs:
+    `base_0_rgb`, `wrist_0_rgb`, `left_tactile_0_rgb`, `right_tactile_0_rgb`.
+  - Keeps `action_horizon=20`, `batch_size=16`, and 8-dimensional
+    absolute-joint state/actions.
+
 ## 2026-07-15: `config_insert_USB_vision_lora_20260715.py`
 
 Snapshot of the active `config.py` after setting up the first Insert USB vision
@@ -207,6 +249,47 @@ Notes:
   `examples/insert_usb/convert_insert_usb_sim_to_lerobot.py`.
 - Run norm stats for this config after conversion. The stats are separate from
   real data because the sim EEF and gripper distributions can differ.
+
+## 2026-07-18: `pi05_insert_usb_sim_abs_joint_vision_lora`
+
+Snapshot file:
+
+- `config_insert_USB_sim_abs_joint_vision_lora_20260718.py`
+
+This records the active config state after adding the simulated GelSight Insert
+USB absolute-joint LoRA path, before adding the four-image tactile joint config.
+
+Main setup:
+
+- Config name: `pi05_insert_usb_sim_abs_joint_vision_lora`
+- Dataset repo id: `wyf/insert_usb_sim_abs_joint`
+- Dataset root: `/shareNFS_40/wyf/data/lerobot/wyf/insert_usb_sim_abs_joint`
+- Prompt: `pick and insert the USB`
+- `prompt_from_task=False`
+- Raw state/action dimension: `8`
+- State/action meaning: `[7 Franka joints, 1 gripper]`
+- OpenPI model action dimension remains `32`; the 8 real dimensions are padded
+  before the model and sliced back after inference.
+- `action_horizon=20`
+- `batch_size=16`
+- `num_train_steps=30_000`
+- `paligemma_variant="gemma_2b_lora"`
+- `action_expert_variant="gemma_300m_lora"`
+
+Image inputs:
+
+- `base_0_rgb`: simulated head camera
+- `left_wrist_0_rgb`: simulated wrist camera
+- `right_wrist_0_rgb`: masked zero image placeholder
+
+Follow-up active config added after this snapshot:
+
+- `pi05_insert_usb_sim_abs_joint_vision_tactile_lora`
+  - Uses the same `wyf/insert_usb_sim_abs_joint` dataset.
+  - Uses all four image inputs:
+    `base_0_rgb`, `wrist_0_rgb`, `left_tactile_0_rgb`, `right_tactile_0_rgb`.
+  - Keeps `action_horizon=20`, `batch_size=16`, and 8-dimensional
+    absolute-joint state/actions.
 
 ## 2026-07-15: `pi05_insert_usb_real_abs_eef_vision_tactile_action_expert_ft`
 

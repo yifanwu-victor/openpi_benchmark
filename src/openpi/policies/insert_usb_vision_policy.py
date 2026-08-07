@@ -7,7 +7,11 @@ from openpi import transforms
 from openpi.models import model as _model
 
 
-ACTION_DIM = 10
+ABS_EEF_ACTION_DIM = 10
+ABS_JOINT_ACTION_DIM = 8
+DELTA_EEF_STATE_DIM = 8
+DELTA_EEF_ACTION_DIM = 7
+ACTION_DIM = ABS_EEF_ACTION_DIM
 DEFAULT_PROMPT = "pick and insert the USB"
 VISION_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 VISION_TACTILE_IMAGE_KEYS = ("base_0_rgb", "wrist_0_rgb", "left_tactile_0_rgb", "right_tactile_0_rgb")
@@ -122,5 +126,7 @@ class InsertUsbVisionTactileInputs(transforms.DataTransformFn):
 class InsertUsbVisionOutputs(transforms.DataTransformFn):
     """Return only the real Insert USB action dimensions after model padding."""
 
+    action_dim: int = ABS_EEF_ACTION_DIM
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][..., :ACTION_DIM])}
+        return {"actions": np.asarray(data["actions"][..., : self.action_dim])}

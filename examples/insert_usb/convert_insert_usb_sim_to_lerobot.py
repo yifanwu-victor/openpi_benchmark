@@ -10,24 +10,39 @@ Recommended usage from the OpenPI repo root:
     uv run examples/insert_usb/convert_insert_usb_sim_to_lerobot.py \
         --hdf5-dir /shareNFS_40/wyf/data/UniVTAC/sim/Insert_USB_Tactile \
         --repo-id wyf/insert_usb_sim_abs_eef \
+        --control-mode abs_eef \
         --output-root /shareNFS_40/wyf/data/lerobot \
         --image-size 224 224 \
+        --overwrite
+
+To convert the GelSight simulation data to absolute joint targets:
+
+    uv run examples/insert_usb/convert_insert_usb_sim_to_lerobot.py \
+        --hdf5-dir /shareNFS_40/wyf/data/UniVTAC/sim/insert_USB_GelSight \
+        --repo-id wyf/insert_usb_sim_abs_joint \
+        --control-mode abs_joint \
+        --output-root /shareNFS_40/wyf/data/lerobot \
+        --image-size 224 224 \
+        --drop-terminal-target-frame \
         --overwrite
 
 Default output:
 
     /shareNFS_40/wyf/data/lerobot/wyf/insert_usb_sim_abs_eef
 
-This converter keeps the same LeRobot feature names and state/action format as
-the real Insert USB converter:
+This converter keeps the same LeRobot feature names as the real Insert USB
+converter:
 
     image                <- observation/head/rgb
     wrist_image          <- observation/wrist/rgb
     left_tactile_image   <- tactile/left_tactile/rgb_marker
     right_tactile_image  <- tactile/right_tactile/rgb_marker
 
-    state   = [eef_pos(3), eef_rot6d(6), gripper_q(1)]      # shape [10]
-    actions = [target_eef_pos(3), target_eef_rot6d(6), target_gripper_q(1)]
+    abs_eef:
+        state/actions = [eef_pos(3), eef_rot6d(6), gripper_q(1)]      # shape [10]
+
+    abs_joint:
+        state/actions = [franka_joint(7), left_gripper_q(1)]          # shape [8]
 
 Important simulation-specific notes:
 
@@ -35,8 +50,10 @@ Important simulation-specific notes:
   visually correct channel order for this dataset; do not apply BGR->RGB.
 * `embodiment/ee` stores quaternions as [qw, qx, qy, qz]. Convert to xyzw
   before calling scipy Rotation.
-* `embodiment/joint` is [7 arm joints, left finger, right finger]. The two
-  finger values match in the inspected data; this script keeps the right finger.
+* `embodiment/joint` is [7 arm joints, left finger, right finger]. For abs_eef
+  this script keeps the right finger to match the existing EEF dataset. For
+  abs_joint it keeps the first finger value, matching the ACT preprocessing
+  convention of `embodiment/joint[:, 0:8]`.
 """
 
 from __future__ import annotations
@@ -45,6 +62,7 @@ import argparse
 from collections.abc import Iterable
 from pathlib import Path
 import shutil
+import time
 
 import cv2
 import h5py
@@ -72,12 +90,16 @@ IMAGE_STREAMS = {
     "right_tactile_image": "tactile/right_tactile/rgb_marker",
 }
 
-REQUIRED_DATASETS = (
+BASE_REQUIRED_DATASETS = (
     "step",
     "embodiment/joint",
-    "embodiment/ee",
     *IMAGE_STREAMS.values(),
 )
+
+CONTROL_MODE_DIMS = {
+    "abs_eef": 10,
+    "abs_joint": 8,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         "--repo-id",
         default=DEFAULT_REPO_ID,
         help=f"LeRobot repo id. Default: {DEFAULT_REPO_ID}",
+    )
+    parser.add_argument(
+        "--control-mode",
+        choices=tuple(CONTROL_MODE_DIMS),
+        default="abs_eef",
+        help="State/action representation to write. Default: abs_eef.",
     )
     parser.add_argument(
         "--output-root",
@@ -132,8 +160,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Absolute action target offset in selected frames. "
-            "Default 1 means actions[t] = state[t + 1]."
+            "Absolute action target offset in raw frames. "
+            "Default 1 means actions at raw frame t are state at raw frame t + 1."
+        ),
+    )
+    parser.add_argument(
+        "--drop-terminal-target-frame",
+        action="store_true",
+        help=(
+            "Drop selected frames whose target would be clamped to the final frame. "
+            "Use this for exact ACT-style state=joint[:-1], action=joint[1:] pairs."
+        ),
+    )
+    parser.add_argument(
+        "--joint-gripper-index",
+        type=int,
+        default=7,
+        help=(
+            "Column in embodiment/joint to use as the abs_joint gripper value. "
+            "Default 7 means the first finger after the 7 Franka joints."
         ),
     )
     parser.add_argument(
@@ -164,6 +209,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="LeRobot image writer threads. Default: 10.",
+    )
+    parser.add_argument(
+        "--read-retries",
+        type=int,
+        default=3,
+        help="Number of retries for transient HDF5 image read errors. Default: 3.",
+    )
+    parser.add_argument(
+        "--read-retry-delay",
+        type=float,
+        default=0.5,
+        help="Seconds to wait between HDF5 image read retries. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--bad-image-policy",
+        choices=("error", "previous", "zero"),
+        default="error",
+        help=(
+            "What to do when a JPEG frame cannot be read or decoded after retries. "
+            "'previous' reuses the previous image from the same stream, falling back to zeros for the first frame. "
+            "Default: error."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -210,10 +277,19 @@ def sorted_hdf5_paths(hdf5_dir: Path, episode_ids: list[str] | None) -> list[Pat
     return paths
 
 
-def selected_indices(num_frames: int, frame_stride: int) -> np.ndarray:
+def selected_indices(
+    num_frames: int,
+    frame_stride: int,
+    target_offset: int = 1,
+    drop_terminal_target_frame: bool = False,
+) -> np.ndarray:
     if frame_stride <= 0:
         raise ValueError(f"--frame-stride must be positive, got {frame_stride}")
-    indices = np.arange(0, num_frames, frame_stride, dtype=np.int64)
+    if target_offset <= 0:
+        raise ValueError(f"--target-offset must be positive, got {target_offset}")
+
+    stop = num_frames - target_offset if drop_terminal_target_frame else num_frames
+    indices = np.arange(0, stop, frame_stride, dtype=np.int64)
     if len(indices) < 2:
         raise ValueError(
             f"Need at least 2 selected frames, got {len(indices)} from {num_frames} frames with stride {frame_stride}"
@@ -221,17 +297,40 @@ def selected_indices(num_frames: int, frame_stride: int) -> np.ndarray:
     return indices
 
 
-def decode_sim_rgb_jpeg(dataset: h5py.Dataset, frame_index: int) -> np.ndarray:
+def decode_sim_rgb_jpeg(
+    dataset: h5py.Dataset,
+    frame_index: int,
+    read_retries: int = 3,
+    read_retry_delay: float = 0.5,
+) -> np.ndarray:
     """Decode one simulated RGB image.
 
     The simulated data was encoded with OpenCV from arrays that already looked
     correct in RGB order. Applying BGR->RGB here visibly swaps red and blue.
     """
 
-    buffer = np.frombuffer(dataset[frame_index], dtype=np.uint8)
+    last_error: OSError | None = None
+    for attempt in range(max(1, read_retries + 1)):
+        try:
+            buffer = np.frombuffer(dataset[frame_index], dtype=np.uint8)
+            break
+        except OSError as exc:
+            last_error = exc
+            if attempt >= read_retries:
+                raise OSError(
+                    f"Failed to read {dataset.name}[{frame_index}] after {read_retries + 1} attempts"
+                ) from exc
+            time.sleep(read_retry_delay)
+    else:  # pragma: no cover
+        raise OSError(f"Failed to read {dataset.name}[{frame_index}]") from last_error
+
     image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError(f"OpenCV failed to decode image frame {frame_index} from {dataset.name}")
+        first_bytes = buffer[:16].tolist()
+        raise ValueError(
+            f"OpenCV failed to decode image frame {frame_index} from {dataset.name}; "
+            f"buffer length={len(buffer)}, first bytes={first_bytes}"
+        )
     return image
 
 
@@ -244,8 +343,17 @@ def resize_image(image: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
 
 
-def validate_hdf5_episode(h5_file: h5py.File, path: Path) -> int:
-    missing = [key for key in REQUIRED_DATASETS if key not in h5_file]
+def required_datasets(control_mode: str) -> tuple[str, ...]:
+    if control_mode == "abs_eef":
+        return (*BASE_REQUIRED_DATASETS, "embodiment/ee")
+    if control_mode == "abs_joint":
+        return BASE_REQUIRED_DATASETS
+    raise ValueError(f"Unsupported control mode: {control_mode}")
+
+
+def validate_hdf5_episode(h5_file: h5py.File, path: Path, control_mode: str) -> int:
+    required = required_datasets(control_mode)
+    missing = [key for key in required if key not in h5_file]
     if missing:
         raise KeyError(f"{path}: missing required datasets {missing}")
 
@@ -253,17 +361,18 @@ def validate_hdf5_episode(h5_file: h5py.File, path: Path) -> int:
     if num_frames < 2:
         raise ValueError(f"{path}: expected at least 2 frames, got {num_frames}")
 
-    for key in REQUIRED_DATASETS:
+    for key in required:
         length = int(h5_file[key].shape[0])
         if length != num_frames:
             raise ValueError(f"{path}: {key} length {length} does not match step length {num_frames}")
 
     joint_shape = h5_file["embodiment/joint"].shape
-    ee_shape = h5_file["embodiment/ee"].shape
     if len(joint_shape) != 2 or joint_shape[1] < 9:
         raise ValueError(f"{path}: expected embodiment/joint shape [T, >=9], got {joint_shape}")
-    if len(ee_shape) != 2 or ee_shape[1] != 7:
-        raise ValueError(f"{path}: expected embodiment/ee shape [T, 7], got {ee_shape}")
+    if control_mode == "abs_eef":
+        ee_shape = h5_file["embodiment/ee"].shape
+        if len(ee_shape) != 2 or ee_shape[1] != 7:
+            raise ValueError(f"{path}: expected embodiment/ee shape [T, 7], got {ee_shape}")
 
     return num_frames
 
@@ -301,17 +410,31 @@ def make_abs_eef_state(joint: np.ndarray, ee: np.ndarray) -> np.ndarray:
     return np.concatenate([eef_pos, eef_rot6d, gripper_q], axis=1).astype(np.float32)
 
 
-def make_action_targets(abs_eef_state: np.ndarray, target_offset: int) -> np.ndarray:
+def make_abs_joint_state(joint: np.ndarray, gripper_index: int) -> np.ndarray:
+    joint = np.asarray(joint, dtype=np.float32)
+    if joint.ndim != 2 or joint.shape[1] < 8:
+        raise ValueError(f"Expected joint shape [T, >=8], got {joint.shape}")
+    if not 7 <= gripper_index < joint.shape[1]:
+        raise ValueError(
+            f"--joint-gripper-index must select a gripper column in [7, {joint.shape[1] - 1}], got {gripper_index}"
+        )
+
+    arm_q = joint[:, :7]
+    gripper_q = joint[:, gripper_index : gripper_index + 1]
+    return np.concatenate([arm_q, gripper_q], axis=1).astype(np.float32)
+
+
+def make_state_targets(state: np.ndarray, source_indices: np.ndarray, target_offset: int) -> np.ndarray:
     if target_offset <= 0:
         raise ValueError(f"--target-offset must be positive, got {target_offset}")
-    indices = np.arange(len(abs_eef_state), dtype=np.int64) + target_offset
-    indices = np.minimum(indices, len(abs_eef_state) - 1)
-    return abs_eef_state[indices].astype(np.float32)
+    indices = np.asarray(source_indices, dtype=np.int64) + target_offset
+    indices = np.minimum(indices, len(state) - 1)
+    return state[indices].astype(np.float32)
 
 
-def inspect_episode(path: Path, image_size: tuple[int, int]) -> dict:
+def inspect_episode(path: Path, image_size: tuple[int, int], control_mode: str) -> dict:
     with h5py.File(path, "r") as h5_file:
-        num_frames = validate_hdf5_episode(h5_file, path)
+        num_frames = validate_hdf5_episode(h5_file, path, control_mode)
         image_shapes = {
             feature_name: image_shape(h5_file, h5_key, image_size)
             for feature_name, h5_key in IMAGE_STREAMS.items()
@@ -338,7 +461,7 @@ def infer_fps(step: np.ndarray, frame_stride: int, fallback: int) -> int:
     return max(1, raw_fps // max(1, frame_stride))
 
 
-def build_features(image_shapes: dict[str, tuple[int, int, int]]) -> dict:
+def build_features(image_shapes: dict[str, tuple[int, int, int]], control_mode: str) -> dict:
     features = {}
     for feature_name, shape in image_shapes.items():
         features[feature_name] = {
@@ -347,17 +470,27 @@ def build_features(image_shapes: dict[str, tuple[int, int, int]]) -> dict:
             "names": ["height", "width", "channel"],
         }
 
+    state_dim = CONTROL_MODE_DIMS[control_mode]
     features["state"] = {
         "dtype": "float32",
-        "shape": (10,),
+        "shape": (state_dim,),
         "names": ["state"],
     }
     features["actions"] = {
         "dtype": "float32",
-        "shape": (10,),
+        "shape": (state_dim,),
         "names": ["actions"],
     }
     return features
+
+
+def make_states_for_mode(h5_file: h5py.File, control_mode: str, joint_gripper_index: int) -> np.ndarray:
+    joint = h5_file["embodiment/joint"][()]
+    if control_mode == "abs_eef":
+        return make_abs_eef_state(joint, h5_file["embodiment/ee"][()])
+    if control_mode == "abs_joint":
+        return make_abs_joint_state(joint, joint_gripper_index)
+    raise ValueError(f"Unsupported control mode: {control_mode}")
 
 
 def convert_episode(
@@ -367,17 +500,22 @@ def convert_episode(
     frame_stride: int,
     target_offset: int,
     image_size: tuple[int, int],
+    control_mode: str,
+    joint_gripper_index: int,
+    drop_terminal_target_frame: bool,
+    read_retries: int,
+    read_retry_delay: float,
+    bad_image_policy: str,
 ) -> int:
     with h5py.File(hdf5_path, "r") as h5_file:
-        num_frames = validate_hdf5_episode(h5_file, hdf5_path)
-        indices = selected_indices(num_frames, frame_stride)
+        num_frames = validate_hdf5_episode(h5_file, hdf5_path, control_mode)
+        indices = selected_indices(num_frames, frame_stride, target_offset, drop_terminal_target_frame)
 
-        abs_eef_state_all = make_abs_eef_state(
-            h5_file["embodiment/joint"][()],
-            h5_file["embodiment/ee"][()],
-        )
-        states = abs_eef_state_all[indices]
-        actions = make_action_targets(states, target_offset)
+        state_all = make_states_for_mode(h5_file, control_mode, joint_gripper_index)
+        states = state_all[indices]
+        actions = make_state_targets(state_all, indices, target_offset)
+        last_images: dict[str, np.ndarray] = {}
+        bad_image_count = 0
 
         for out_idx, raw_idx in enumerate(indices):
             frame = {
@@ -386,8 +524,41 @@ def convert_episode(
                 "task": task_prompt,
             }
             for feature_name, h5_key in IMAGE_STREAMS.items():
-                frame[feature_name] = resize_image(decode_sim_rgb_jpeg(h5_file[h5_key], int(raw_idx)), image_size)
+                try:
+                    image = resize_image(
+                        decode_sim_rgb_jpeg(
+                            h5_file[h5_key],
+                            int(raw_idx),
+                            read_retries=read_retries,
+                            read_retry_delay=read_retry_delay,
+                        ),
+                        image_size,
+                    )
+                except Exception as exc:
+                    if bad_image_policy == "error":
+                        raise RuntimeError(f"{hdf5_path}: failed to decode {h5_key}[{int(raw_idx)}]") from exc
+
+                    bad_image_count += 1
+                    if bad_image_policy == "previous" and feature_name in last_images:
+                        image = last_images[feature_name].copy()
+                        replacement = "previous"
+                    else:
+                        width, height = image_size
+                        image = np.zeros((height, width, 3), dtype=np.uint8)
+                        replacement = "zero"
+
+                    if bad_image_count <= 20 or bad_image_count % 100 == 0:
+                        print(
+                            f"Warning: {hdf5_path.name} {h5_key}[{int(raw_idx)}] failed "
+                            f"({type(exc).__name__}: {exc}); using {replacement} image."
+                        )
+
+                frame[feature_name] = image
+                last_images[feature_name] = image
             dataset.add_frame(frame)
+
+        if bad_image_count:
+            print(f"Warning: replaced {bad_image_count} bad image frame(s) in {hdf5_path}")
 
     dataset.save_episode()
     return len(indices)
@@ -407,19 +578,29 @@ def main() -> None:
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
 
-    first_episode = inspect_episode(episodes[0], image_size)
-    indices = selected_indices(first_episode["num_frames"], args.frame_stride)
+    first_episode = inspect_episode(episodes[0], image_size, args.control_mode)
+    indices = selected_indices(
+        first_episode["num_frames"],
+        args.frame_stride,
+        args.target_offset,
+        args.drop_terminal_target_frame,
+    )
     fps = args.fps or infer_fps(first_episode["step"], args.frame_stride, DEFAULT_FPS)
-    features = build_features(first_episode["image_shapes"])
+    features = build_features(first_episode["image_shapes"], args.control_mode)
 
     print(f"HDF5 dir: {hdf5_dir}")
     print(f"Episodes: {len(episodes)}")
     print(f"Repo id: {args.repo_id}")
     print(f"Output dataset root: {dataset_root}")
+    print(f"Control mode: {args.control_mode}")
     print(f"FPS: {fps}")
     print(f"Frame stride: {args.frame_stride}")
     print(f"Selected frames in first episode: {len(indices)} / {first_episode['num_frames']}")
-    print(f"Target offset: {args.target_offset} selected frame(s)")
+    print(f"Target offset: {args.target_offset} raw frame(s)")
+    print(f"Drop terminal target frame: {args.drop_terminal_target_frame}")
+    if args.control_mode == "abs_joint":
+        print(f"Joint gripper index: {args.joint_gripper_index}")
+    print(f"Bad image policy: {args.bad_image_policy}")
     print(f"Image size: {image_size[0]}x{image_size[1]} (width x height)")
     print("Features:")
     for key, value in features.items():
@@ -453,6 +634,12 @@ def main() -> None:
             frame_stride=args.frame_stride,
             target_offset=args.target_offset,
             image_size=image_size,
+            control_mode=args.control_mode,
+            joint_gripper_index=args.joint_gripper_index,
+            drop_terminal_target_frame=args.drop_terminal_target_frame,
+            read_retries=args.read_retries,
+            read_retry_delay=args.read_retry_delay,
+            bad_image_policy=args.bad_image_policy,
         )
 
     print(f"Done. Wrote {len(episodes)} episodes and {total_frames} frames to {dataset_root}")
