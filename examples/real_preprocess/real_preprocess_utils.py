@@ -267,6 +267,27 @@ def delta_eef_actions(states: dict[str, np.ndarray], selected_indices: np.ndarra
     return np.concatenate([delta_xyz, delta_rotvec, target_gripper_q], axis=1).astype(np.float32)
 
 
+def raw_delta_eef_actions_with_next_gripper(
+    states: dict[str, np.ndarray], selected_indices: np.ndarray, target_offset: int
+) -> np.ndarray:
+    if target_offset <= 0:
+        raise ValueError(f"target_offset must be positive, got {target_offset}")
+    if "action" not in states:
+        raise KeyError("states.npz is missing raw action; cannot build raw-action delta_eef targets")
+
+    raw_action = np.asarray(states["action"], dtype=np.float32)
+    gripper_q = np.asarray(states["gripper_q"], dtype=np.float32).reshape(-1, 1)
+    if raw_action.ndim != 2 or raw_action.shape[1] < 6:
+        raise ValueError(f"Expected raw action shape [T, >=6], got {raw_action.shape}")
+    if raw_action.shape[0] != gripper_q.shape[0]:
+        raise ValueError(f"raw action length {raw_action.shape[0]} does not match gripper_q length {gripper_q.shape[0]}")
+
+    target_indices = np.minimum(selected_indices + target_offset, len(gripper_q) - 1)
+    delta_eef = raw_action[selected_indices, :6]
+    target_gripper_q = gripper_q[target_indices]
+    return np.concatenate([delta_eef, target_gripper_q], axis=1).astype(np.float32)
+
+
 def write_yaml(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:

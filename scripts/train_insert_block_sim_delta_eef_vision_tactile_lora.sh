@@ -17,7 +17,7 @@ CONFIG_NAME="${CONFIG_NAME:-pi05_insert_block_sim_delta_eef_vision_tactile_lora}
 STATS_CONFIG_NAME="${STATS_CONFIG_NAME:-pi05_insert_block_sim_delta_eef_vision_lora}"
 EXP_NAME="${EXP_NAME:-insert_block_sim_delta_eef_vision_tactile_lora_v1}"
 
-GPU_IDS="${GPU_IDS:-4,5,6,7}"
+GPU_IDS="${GPU_IDS:-0,1,2,3}"
 FSDP_DEVICES="${FSDP_DEVICES:-4}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-20000}"

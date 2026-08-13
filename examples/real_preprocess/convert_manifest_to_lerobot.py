@@ -14,10 +14,10 @@ from real_preprocess_utils import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_REPO_ID,
     IMAGE_STREAMS,
-    delta_eef_actions,
     inspect_episode,
     parse_manifest_segments,
     progress,
+    raw_delta_eef_actions_with_next_gripper,
     read_yaml,
     repo_id_to_path,
     resize_rgb_image,
@@ -87,7 +87,7 @@ def convert_segment(
 
     states_all = state_xyz_quat_gripper(episode["states"])
     states = states_all[indices]
-    actions = delta_eef_actions(episode["states"], indices, target_offset)
+    actions = raw_delta_eef_actions_with_next_gripper(episode["states"], indices, target_offset)
     image_paths = episode["image_paths"]
 
     for out_idx, raw_idx in enumerate(indices):
@@ -134,7 +134,7 @@ def main() -> None:
     print(f"FPS: {fps}")
     print(f"Action horizon metadata: {action_horizon}")
     print("State: [eef_xyz, eef_quat_xyzw, gripper_q] shape [8]")
-    print("Actions: [delta_xyz, delta_rotvec, target_gripper_q] shape [7]")
+    print("Actions: [raw_action_delta_xyz, raw_action_delta_rotvec, next_gripper_q] shape [7]")
 
     if args.dry_run:
         total = 0

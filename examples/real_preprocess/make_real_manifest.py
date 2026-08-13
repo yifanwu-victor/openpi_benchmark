@@ -41,8 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--target-offset", type=int, default=DEFAULT_TARGET_OFFSET)
     parser.add_argument("--image-size", nargs=2, type=int, default=DEFAULT_IMAGE_SIZE, metavar=("WIDTH", "HEIGHT"))
-    parser.add_argument("--trim-start-idle", action="store_true", help="Use detected leading idle as start_frame.")
-    parser.add_argument("--trim-end-idle", action="store_true", help="Use detected trailing idle as end_frame.")
+    parser.add_argument(
+        "--trim-start-idle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use detected leading idle as start_frame. Enabled by default; pass --no-trim-start-idle to keep it.",
+    )
+    parser.add_argument(
+        "--trim-end-idle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use detected trailing idle as end_frame. Enabled by default; pass --no-trim-end-idle to keep it.",
+    )
     parser.add_argument("--drop-episodes-file", type=Path, default=None, help="Text file with one raw episode id to drop per line.")
     parser.add_argument("--drop-episode-ids", nargs="*", default=None, help="Raw episode ids to mark as drop.")
     parser.add_argument("--drop-reason", default="drop gripper abnormal episode")
@@ -148,14 +158,18 @@ def main() -> None:
             "task_prompt": args.task_prompt,
             "control_mode": "delta_eef",
             "state_semantics": "[eef_xyz, eef_quat_xyzw, gripper_q]",
-            "action_semantics": "[delta_xyz, delta_rotvec, target_gripper_q]",
+            "action_semantics": "[raw_action_delta_xyz, raw_action_delta_rotvec, next_gripper_q]",
             "target_fps": args.target_fps,
             "action_horizon": args.action_horizon,
             "frame_stride": args.frame_stride,
             "target_offset": args.target_offset,
             "image_size": list(image_size),
             "dropped_episode_count": dropped_count,
-            "notes": "Raw data is not modified. Edit segments manually before conversion if needed.",
+            "notes": (
+                "Raw data is not modified. Default segments trim leading/trailing idle frames. "
+                "Conversion uses states.npz action[:, :6] for delta EEF and next-frame gripper_q for gripper target. "
+                "Edit segments manually before conversion if needed."
+            ),
         },
         "episodes": entries,
     }
