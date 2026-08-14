@@ -21,7 +21,7 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Requirements
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. This fork also includes a TI-ONE/JAX multi-node training path; see [TI-ONE multi-node training](docs/tione_multinode_training.md).
 
 | Mode               | Memory Required | Example GPU        |
 | ------------------ | --------------- | ------------------ |

@@ -70,6 +70,79 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
+def _env_int(*names: str, default: int | None = None) -> int | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            return int(value)
+    return default
+
+
+def _visible_device_count() -> int | None:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None or visible.strip() in ("", "NoDevFiles"):
+        return None
+    return len([device for device in visible.split(",") if device.strip()])
+
+
+def init_jax_distributed_from_env() -> None:
+    """Initialize JAX distributed training from TI-ONE or explicit env vars.
+
+    Single-node runs remain unchanged. For multi-node TI-ONE tasks, set:
+      JAX_NUM_PROCESSES=2
+      JAX_PROCESS_INDEX=0 or 1
+      JAX_COORDINATOR_ADDRESS=<master_addr>:<master_port>
+      JAX_LOCAL_DEVICE_COUNT=8
+    """
+    num_processes = _env_int("JAX_NUM_PROCESSES", "TIONE_NUM_PROCESSES", "WORLD_SIZE", "NNODES", default=1)
+    if num_processes is None or num_processes <= 1:
+        return
+
+    process_id = _env_int("JAX_PROCESS_INDEX", "TIONE_PROCESS_INDEX", "NODE_RANK", "RANK")
+    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    if not coordinator_address:
+        master_addr = os.environ.get("MASTER_ADDR") or os.environ.get("JAX_COORDINATOR_HOST")
+        master_port = os.environ.get("MASTER_PORT") or os.environ.get("JAX_COORDINATOR_PORT") or "23456"
+        if master_addr:
+            coordinator_address = f"{master_addr}:{master_port}"
+
+    if process_id is None:
+        raise ValueError(
+            "Multi-node JAX training requires JAX_PROCESS_INDEX, TIONE_PROCESS_INDEX, NODE_RANK, or RANK."
+        )
+    if not coordinator_address:
+        raise ValueError(
+            "Multi-node JAX training requires JAX_COORDINATOR_ADDRESS or MASTER_ADDR/MASTER_PORT."
+        )
+
+    local_device_count = _env_int("JAX_LOCAL_DEVICE_COUNT", "GPU_NUM_PER_NODE", "LOCAL_WORLD_SIZE")
+    if local_device_count is None:
+        local_device_count = _visible_device_count()
+    local_device_ids = tuple(range(local_device_count)) if local_device_count else None
+
+    kwargs: dict[str, Any] = {
+        "coordinator_address": coordinator_address,
+        "num_processes": num_processes,
+        "process_id": process_id,
+        "local_device_ids": local_device_ids,
+        "initialization_timeout": _env_int("JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT", default=900),
+    }
+    if os.environ.get("JAX_COORDINATOR_BIND_ADDRESS"):
+        kwargs["coordinator_bind_address"] = os.environ["JAX_COORDINATOR_BIND_ADDRESS"]
+
+    print(
+        "[jax-distributed] "
+        f"coordinator={coordinator_address} process={process_id}/{num_processes} "
+        f"local_device_ids={local_device_ids}",
+        flush=True,
+    )
+    jax.distributed.initialize(**kwargs)
+
+
+def is_primary_process() -> bool:
+    return jax.process_index() == 0
+
+
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
@@ -193,15 +266,26 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    init_jax_distributed_from_env()
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+    logging.info(
+        "Running on: %s; JAX process %s/%s; local devices=%s; global devices=%s",
+        platform.node(),
+        jax.process_index(),
+        jax.process_count(),
+        jax.local_device_count(),
+        jax.device_count(),
+    )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser())),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -216,7 +300,7 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and is_primary_process())
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -229,7 +313,8 @@ def main(config: _config.TrainConfig):
 
     # Log images from first batch to sanity check.
     if (
-        config.wandb_enabled
+        is_primary_process()
+        and config.wandb_enabled
         and os.environ.get("WANDB_MODE", "").lower() != "disabled"
         and os.environ.get("OPENPI_SKIP_WANDB_IMAGES", "0") != "1"
     ):
@@ -268,6 +353,7 @@ def main(config: _config.TrainConfig):
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=not is_primary_process(),
     )
 
     infos = []
@@ -279,8 +365,9 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if is_primary_process():
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 

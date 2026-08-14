@@ -8,6 +8,7 @@ from typing import Protocol
 
 from etils import epath
 import jax
+import jax.experimental.multihost_utils as multihost_utils
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -22,20 +23,30 @@ def initialize_checkpoint_dir(
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
-            resuming = True
-        else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
+    is_primary = jax.process_index() == 0
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if is_primary:
+        if checkpoint_dir.exists():
+            if overwrite:
+                checkpoint_dir.rmtree()
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            elif resume:
+                resuming = True
+            else:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                    "to indicate how to handle it."
+                )
+
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices("checkpoint_dir_initialized")
+
+    if not is_primary:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        resuming = resume and checkpoint_dir.exists()
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -60,7 +71,6 @@ def initialize_checkpoint_dir(
         resuming = False
 
     return mngr, resuming
-
 
 def save_state(
     checkpoint_manager: ocp.CheckpointManager,
