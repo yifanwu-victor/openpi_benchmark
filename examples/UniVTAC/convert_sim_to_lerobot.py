@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Convert UniVTAC simulated HDF5 episodes under /shareNFS_40/wyf/data/UniVTAC/sim
+Convert UniVTAC simulated HDF5 episodes under /home/tione/notebook/data/UniVTAC/sim
 to LeRobot datasets.
 
 Recommended usage from the OpenPI repo root:
 
-    cd /shareNFS_40/wyf/workplace/openpi
-    export HF_LEROBOT_HOME=/shareNFS_40/wyf/data/lerobot
+    cd /home/tione/notebook/openpi_benchmark
+    export HF_LEROBOT_HOME=/home/tione/notebook/data/lerobot
 
     uv run examples/UniVTAC/convert_sim_to_lerobot.py \
-        --hdf5-dir /shareNFS_40/wyf/data/UniVTAC/sim/insert_block \
-        --output-dir /shareNFS_40/wyf/data/lerobot/simulation/insert_block_gelsight_delta_eef \
+        --hdf5-dir /home/tione/notebook/data/UniVTAC/sim/insert_block \
+        --output-dir /home/tione/notebook/data/lerobot/simulation/insert_block_gelsight_delta_eef \
         --control-mode delta_eef \
         --overwrite
 
 Pull Drawer delta EEF form:
 
     uv run examples/UniVTAC/convert_sim_to_lerobot.py \
-        --hdf5-dir /shareNFS_40/wyf/data/UniVTAC/sim/pull_drawer_GelSight \
-        --output-dir /shareNFS_40/wyf/data/lerobot/simulation/pull_drawer_gelsight_delta_eef \
+        --hdf5-dir /home/tione/notebook/data/UniVTAC/sim/pull_drawer_GelSight \
+        --output-dir /home/tione/notebook/data/lerobot/simulation/pull_drawer_gelsight_delta_eef \
         --control-mode delta_eef \
         --overwrite
 
@@ -83,7 +83,7 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 
-DEFAULT_OUTPUT_ROOT = Path("/shareNFS_40/wyf/data/lerobot")
+DEFAULT_OUTPUT_ROOT = Path("/home/tione/notebook/data/lerobot")
 DEFAULT_CONTROL_MODE = "delta_eef"
 DEFAULT_FPS = 60
 DEFAULT_IMAGE_SIZE = (224, 224)
@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
         help=(
             "Base LeRobot output directory used when --output-dir is omitted and for deriving "
-            "repo id from --output-dir. Default: /shareNFS_40/wyf/data/lerobot"
+            "repo id from --output-dir. Default: /home/tione/notebook/data/lerobot"
         ),
     )
     parser.add_argument(
@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Exact local LeRobot dataset directory to write, e.g. "
-            "/shareNFS_40/wyf/data/lerobot/simulation/pull_drawer_gelsight_delta_eef."
+            "/home/tione/notebook/data/lerobot/simulation/pull_drawer_gelsight_delta_eef."
         ),
     )
     parser.add_argument(
