@@ -40,6 +40,83 @@
 
 这些路径都应该位于 CFS 上。当前开发机中 `/home/tione/notebook` 挂载为 NFS/CFS；`/root` 是镜像/容器层，不是 CFS。
 
+
+## 使用其他数据集训练
+
+如果后续换成新的任务或新的数据集，优先保持同一个 CFS 根目录约定：所有训练任务需要读写、且任务结束后仍要保留的东西，都放在 `/home/tione/notebook` 下。镜像里只保存系统环境和 Python runtime，不要把数据、base 权重或训练输出依赖放在 `/root`、`/tmp`、容器临时目录里。
+
+推荐路径约定：
+
+| 内容 | 推荐路径 | 说明 |
+|---|---|---|
+| 原始数据 | `/home/tione/notebook/data/raw/<dataset_name>` | 采集得到的原始文件、解压包、临时标注文件等 |
+| 转换脚本中间产物 | `/home/tione/notebook/data/work/<dataset_name>` | 可删除/可重建的转换中间结果 |
+| LeRobot 训练数据 | `/home/tione/notebook/data/lerobot/<repo_id>` | `LeRobotDataset` 最终读取的数据目录 |
+| OpenPI 初始权重/cache | `/home/tione/notebook/data/openpi/openpi-assets/checkpoints/<base_model>/params` | 例如 `pi05_base/params`，作为微调起点 |
+| Hugging Face cache | `/home/tione/notebook/data/hf_cache` | `HF_HOME`、datasets cache、下载缓存 |
+| JAX 编译缓存 | `/home/tione/notebook/data/jax_cache` | 多机任务共享 XLA/JAX 编译缓存 |
+| norm stats / assets | `/home/tione/notebook/openpi_benchmark/assets/<config_name>/<repo_id>` | 训练前或首次训练时生成的数据归一化统计 |
+| 训练输出 checkpoint | `/home/tione/notebook/checkpoints/<config_name>/<exp_name>` | 训练结果，任务结束后仍保留在 CFS |
+
+这里有两个容易混淆的“权重目录”：
+
+```text
+/home/tione/notebook/data/openpi/...
+```
+
+这是训练起点，通常放 base model 或下载缓存，例如 `pi05_base`。
+
+```text
+/home/tione/notebook/checkpoints/...
+```
+
+这是训练结果，里面保存本次 fine-tune 产生的 Orbax checkpoint。后续评估、导出、续训都应该从这里找。
+
+换数据集的一般流程：
+
+1. 把原始数据放到 CFS，例如 `/home/tione/notebook/data/raw/my_task_v1`。
+2. 编写或复用转换脚本，把原始数据转换成 LeRobot 格式。
+3. 将转换后的数据保存到 `/home/tione/notebook/data/lerobot/<repo_id>`。`<repo_id>` 建议使用稳定、可读的名字，例如 `simulation/my_task_v1` 或 `real/my_robot_pick_v1`。
+4. 在 `src/openpi/training/config.py` 中新增或复制一个 `TrainConfig`，让它的 data config 指向新的 `<repo_id>`，并设置正确的 prompt、action 维度、相机/触觉输入等字段。
+5. 确认 `weight_loader` 指向合适的初始权重。继续从 pi05 base 微调时，通常仍使用 `/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params`。
+6. 为新任务准备对应的 norm stats。可以先让主进程自动计算，也可以在开发机上预先生成并确认它落在 `assets/<config_name>/<repo_id>` 下。
+7. 新建一个任务专用 wrapper 或复用当前 wrapper，但至少要覆盖 `CONFIG_NAME`、`STATS_CONFIG_NAME`、`EXP_NAME`，必要时也覆盖 `HF_LEROBOT_HOME`、`CHECKPOINT_BASE_DIR`、`PI05_BASE_DIR`。
+8. 先用很小的 `NUM_TRAIN_STEPS` 做 debug，确认能读数据、能保存 checkpoint，再提交正式多机训练。
+
+换数据集时最少需要确认这些变量：
+
+```bash
+CONFIG_NAME=<新的 TrainConfig 名字>
+STATS_CONFIG_NAME=<用于 norm stats 的 config 名字，通常和 CONFIG_NAME 相同或复用同输入结构的 config>
+EXP_NAME=<实验名，例如 my_task_2x8_bs256_5k_v1>
+BATCH_SIZE=256
+NUM_TRAIN_STEPS=5000
+SAVE_INTERVAL=1000
+LOG_INTERVAL=100
+```
+
+如果只是换数据，不换 base model，通常不需要重新保存镜像；只要代码、转换后的 LeRobot 数据、norm stats、base 权重都在 CFS，训练任务挂载同一个 CFS 即可。如果新增了 Python 包、系统库、CUDA/JAX 相关依赖，才需要重新保存开发机镜像。
+
+提交正式训练前建议检查：
+
+```bash
+cd /home/tione/notebook/openpi_benchmark
+export PATH="$HOME/.local/bin:$PATH"
+
+df -hT /home/tione/notebook
+test -d /home/tione/notebook/data/lerobot/<repo_id>
+test -d /home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params
+test -d assets/<config_name>/<repo_id> || echo "norm stats missing; first run must generate it"
+```
+
+如果使用新 base model，也要把它放到 CFS，例如：
+
+```bash
+/home/tione/notebook/data/openpi/openpi-assets/checkpoints/<new_base_model>/params
+```
+
+然后在 `TrainConfig.weight_loader` 中指向这个路径，或者通过脚本参数/环境变量让对应 config 使用这个权重。
+
 ## 镜像与 uv 环境
 
 本仓库使用 `uv` 管理 Python 环境。当前 `.venv` 位于：
