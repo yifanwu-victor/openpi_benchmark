@@ -33,6 +33,7 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 KEEP_PERIOD="${KEEP_PERIOD:-5000}"
 FORCE_NORM_STATS="${FORCE_NORM_STATS:-0}"
 RESUME="${RESUME:-0}"
+LOG_INTERVAL="${LOG_INTERVAL:-100}"
 
 CHECKPOINT_BASE_DIR="${CHECKPOINT_BASE_DIR:-/home/tione/notebook/checkpoints}"
 PI05_BASE_DIR="${PI05_BASE_DIR:-/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base}"
@@ -64,6 +65,34 @@ export PATH="$HOME/.local/bin:$PATH"
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 export OPENPI_DATA_HOME HF_HOME HF_DATASETS_CACHE HF_LEROBOT_HOME
 export XLA_PYTHON_CLIENT_PREALLOCATE UV_LINK_MODE GIT_LFS_SKIP_SMUDGE
+
+require_positive_int() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ ! "$value" =~ ^[0-9]+$ || "$value" -le 0 ]]; then
+    echo "[error] ${name} must be a positive integer, got '${value}'" >&2
+    exit 1
+  fi
+}
+
+require_positive_int BATCH_SIZE
+require_positive_int NUM_TRAIN_STEPS
+require_positive_int SAVE_INTERVAL
+require_positive_int LOG_INTERVAL
+
+if [[ "${JAX_NUM_PROCESSES:-1}" =~ ^[0-9]+$ && "${JAX_NUM_PROCESSES:-1}" -gt 1 ]]; then
+  if (( BATCH_SIZE % JAX_NUM_PROCESSES != 0 )); then
+    echo "[error] BATCH_SIZE=${BATCH_SIZE} must be divisible by JAX_NUM_PROCESSES=${JAX_NUM_PROCESSES}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$EXP_NAME" =~ bs([0-9]+) ]]; then
+  name_bs="${BASH_REMATCH[1]}"
+  if [[ "$name_bs" != "$BATCH_SIZE" ]]; then
+    echo "[warn] EXP_NAME contains bs${name_bs}, but BATCH_SIZE=${BATCH_SIZE}" >&2
+  fi
+fi
 
 if [[ ! -d "$DATASET_DIR" ]]; then
   echo "[error] missing LeRobot dataset: ${DATASET_DIR}" >&2
@@ -141,6 +170,8 @@ fi
 echo "[train] config=${CONFIG_NAME}"
 echo "[train] exp=${EXP_NAME}"
 echo "[train] GPUs=${GPU_IDS}, fsdp_devices=${FSDP_DEVICES}, global_batch_size=${BATCH_SIZE}"
+echo "[train] steps=${NUM_TRAIN_STEPS}, save_interval=${SAVE_INTERVAL}, keep_period=${KEEP_PERIOD}, log_interval=${LOG_INTERVAL}, resume=${RESUME}"
+echo "[train] jax_process=${JAX_PROCESS_INDEX:-0}/${JAX_NUM_PROCESSES:-1}, coordinator=${JAX_COORDINATOR_ADDRESS:-single-node}"
 echo "[train] dataset=${DATASET_DIR}"
 echo "[train] pi05_base=${PI05_BASE_DIR}"
 echo "[train] checkpoint dir=${RUN_DIR}"
@@ -153,6 +184,7 @@ uv run scripts/train.py \
   --batch-size "$BATCH_SIZE" \
   --save-interval "$SAVE_INTERVAL" \
   --keep-period "$KEEP_PERIOD" \
+  --log-interval "$LOG_INTERVAL" \
   --fsdp-devices "$FSDP_DEVICES" \
   $(if [[ "$RESUME" == "1" ]]; then echo "--resume"; else echo "--overwrite"; fi)
 

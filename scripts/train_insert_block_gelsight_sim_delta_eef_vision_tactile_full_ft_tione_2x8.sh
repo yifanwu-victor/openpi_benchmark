@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TI-ONE task wrapper for JAX multi-node training:
+# Per-node TI-ONE/JAX worker wrapper for multi-node training:
 #   2 CVM nodes x 8 GPUs = 16 global devices.
 #
-# Submit as a TI-ONE distributed/JAX task with:
-#   node count: 2
-#   GPUs per node: 8
-#   startup command:
-#     bash scripts/train_insert_block_gelsight_sim_delta_eef_vision_tactile_full_ft_tione_2x8.sh
+# Normally launched by scripts/tione_mpi_train.sh via mpirun.
+# Keep this script as the per-node worker entrypoint and for advanced/manual runs.
 
 REPO_ROOT="${REPO_ROOT:-/home/tione/notebook/openpi_benchmark}"
 cd "$REPO_ROOT"
@@ -24,6 +21,7 @@ export JAX_PROCESS_INDEX="${JAX_PROCESS_INDEX:-${NODE_RANK:-${RANK:-0}}}"
 export MASTER_PORT="${MASTER_PORT:-23456}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/home/tione/notebook/data/jax_cache}"
 export OPENPI_SKIP_WANDB_IMAGES="${OPENPI_SKIP_WANDB_IMAGES:-1}"
+export LOG_INTERVAL="${LOG_INTERVAL:-100}"
 
 if [[ "${JAX_NUM_PROCESSES}" != "1" ]]; then
   if [[ -z "${JAX_COORDINATOR_ADDRESS:-}" ]]; then
@@ -43,5 +41,7 @@ echo "[tione-2x8] JAX_NUM_PROCESSES=${JAX_NUM_PROCESSES}"
 echo "[tione-2x8] JAX_PROCESS_INDEX=${JAX_PROCESS_INDEX}"
 echo "[tione-2x8] JAX_COORDINATOR_ADDRESS=${JAX_COORDINATOR_ADDRESS:-single-node}"
 echo "[tione-2x8] GPU_IDS=${GPU_IDS}, FSDP_DEVICES=${FSDP_DEVICES}, BATCH_SIZE=${BATCH_SIZE}"
+echo "[tione-2x8] NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-20000}, SAVE_INTERVAL=${SAVE_INTERVAL:-5000}, LOG_INTERVAL=${LOG_INTERVAL}"
+echo "[tione-2x8] EXP_NAME=${EXP_NAME:-<local-wrapper-default>}"
 
 bash scripts/train_insert_block_gelsight_sim_delta_eef_vision_tactile_full_ft_local.sh

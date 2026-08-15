@@ -144,36 +144,41 @@ CFS 挂载路径：/home/tione/notebook
 代码路径：/home/tione/notebook/openpi_benchmark
 ```
 
-启动命令先使用 debug 版本：
+启动命令先使用 debug 版本。TI-ONE UI 里只需要调用 `scripts/tione_mpi_train.sh`，该脚本会自动解析 `NODE_LIST`、设置 JAX coordinator，并通过 `mpirun` 在每个节点启动一个 JAX 进程：
 
 ```bash
 cd /home/tione/notebook/openpi_benchmark
 BATCH_SIZE=64 \
 NUM_TRAIN_STEPS=20 \
-SAVE_INTERVAL=10 \
-EXP_NAME=debug_2x8_bs64_v1 \
-bash scripts/train_insert_block_gelsight_sim_delta_eef_vision_tactile_full_ft_tione_2x8.sh
+SAVE_INTERVAL=20 \
+LOG_INTERVAL=10 \
+EXP_NAME=debug_2x8_bs64_20steps_v1 \
+bash scripts/tione_mpi_train.sh
 ```
 
-debug 通过后，再提交正式训练：
+debug 通过后，再提交正式训练。下面这个配置和历史 `4卡 bs64 20000步` 的总样本量接近：
 
 ```bash
 cd /home/tione/notebook/openpi_benchmark
 BATCH_SIZE=256 \
-NUM_TRAIN_STEPS=20000 \
-SAVE_INTERVAL=5000 \
-EXP_NAME=insert_block_2x8_bs256_v1 \
-bash scripts/train_insert_block_gelsight_sim_delta_eef_vision_tactile_full_ft_tione_2x8.sh
+NUM_TRAIN_STEPS=5000 \
+SAVE_INTERVAL=1000 \
+KEEP_PERIOD=1000 \
+LOG_INTERVAL=100 \
+EXP_NAME=openpi05_2x8_bs256_5k_v1 \
+bash scripts/tione_mpi_train.sh
 ```
 
-如果需要续训：
+如果需要续训，必须显式指定同一个 `EXP_NAME`：
 
 ```bash
 cd /home/tione/notebook/openpi_benchmark
 RESUME=1 \
 BATCH_SIZE=256 \
-EXP_NAME=insert_block_2x8_bs256_v1 \
-bash scripts/train_insert_block_gelsight_sim_delta_eef_vision_tactile_full_ft_tione_2x8.sh
+NUM_TRAIN_STEPS=5000 \
+SAVE_INTERVAL=1000 \
+EXP_NAME=openpi05_2x8_bs256_5k_v1 \
+bash scripts/tione_mpi_train.sh
 ```
 
 不要对已有重要实验名使用默认 `RESUME=0`，因为脚本会传 `--overwrite`，同名输出目录会被清理。
