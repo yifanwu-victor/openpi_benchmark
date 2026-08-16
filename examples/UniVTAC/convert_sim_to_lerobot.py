@@ -28,6 +28,10 @@ Current implementation:
         state   = [franka_joint(7), gripper_q(1)]
         actions = next-frame absolute joint target with the same layout
 
+    delta_joint:
+        state   = [franka_joint(7), gripper_q(1)]
+        actions = [target_joint(7) - current_joint(7), target_gripper_q(1)]
+
     delta_eef:
         state   = [eef_pos(3), eef_quat_xyzw(4), gripper_q(1)]
         actions = [delta_xyz(3), delta_rotvec(3), target_gripper_q(1)]
@@ -54,7 +58,8 @@ Simulation-specific notes:
   The per-episode instruction is written to the LeRobot task field.
 * delta_eef uses world-frame delta rotation:
   R_delta = R_target @ R_current.T.
-* abs_eef and delta_joint are intentionally left as future modes.
+* delta_joint uses the current selected frame as the joint delta base.
+* abs_eef is intentionally left as a future mode.
 """
 
 from __future__ import annotations
@@ -106,6 +111,7 @@ BASE_REQUIRED_DATASETS = (
 
 CONTROL_MODE_DIMS = {
     "abs_joint": (8, 8),
+    "delta_joint": (8, 8),
     "delta_eef": (8, 7),
 }
 
@@ -130,6 +136,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "State/action representation to write. "
             "abs_joint writes state/action [joint7, gripper]. "
+            "delta_joint writes state [joint7, gripper] and action [delta_joint7, target_gripper]. "
             "delta_eef writes state [xyz, quat_xyzw, gripper] and action [dxyz, drotvec, target_gripper]. "
             f"Default: {DEFAULT_CONTROL_MODE}."
         ),
@@ -440,7 +447,7 @@ def resize_image(image: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
 
 
 def required_datasets(control_mode: str) -> tuple[str, ...]:
-    if control_mode == "abs_joint":
+    if control_mode in {"abs_joint", "delta_joint"}:
         return BASE_REQUIRED_DATASETS
     if control_mode == "delta_eef":
         return (*BASE_REQUIRED_DATASETS, "embodiment/ee")
@@ -508,6 +515,27 @@ def make_abs_joint_state(joint: np.ndarray, gripper_mode: str) -> np.ndarray:
     arm_q = joint[:, :7]
     gripper_q = make_gripper_q(joint, gripper_mode)
     return np.concatenate([arm_q, gripper_q], axis=1).astype(np.float32)
+
+
+def make_delta_joint_actions(
+    joint: np.ndarray,
+    source_indices: np.ndarray,
+    target_offset: int,
+    gripper_mode: str,
+) -> np.ndarray:
+    if target_offset <= 0:
+        raise ValueError(f"--target-offset must be positive, got {target_offset}")
+
+    joint = np.asarray(joint, dtype=np.float32)
+    if joint.ndim != 2 or joint.shape[1] < 9:
+        raise ValueError(f"Expected joint shape [T, >=9], got {joint.shape}")
+
+    source_indices = np.asarray(source_indices, dtype=np.int64)
+    target_indices = np.minimum(source_indices + target_offset, len(joint) - 1)
+
+    delta_q = joint[target_indices, :7] - joint[source_indices, :7]
+    target_gripper_q = make_gripper_q(joint, gripper_mode)[target_indices]
+    return np.concatenate([delta_q, target_gripper_q], axis=1).astype(np.float32)
 
 
 def rotation_from_quat_wxyz(quat_wxyz: np.ndarray) -> Rotation:
@@ -672,6 +700,10 @@ def make_states_and_actions_for_mode(
     if control_mode == "abs_joint":
         state_all = make_abs_joint_state(joint, gripper_mode)
         return state_all[indices], make_state_targets(state_all, indices, target_offset)
+    if control_mode == "delta_joint":
+        state_all = make_abs_joint_state(joint, gripper_mode)
+        actions = make_delta_joint_actions(joint, indices, target_offset, gripper_mode)
+        return state_all[indices], actions
     if control_mode == "delta_eef":
         ee = h5_file["embodiment/ee"][()]
         state_all = make_eef_state(joint, ee, gripper_mode)
@@ -835,6 +867,9 @@ def main() -> None:
     if args.control_mode == "delta_eef":
         print("Action semantics: [delta xyz, world-frame delta rotvec, target gripper]")
         print("Terminal frame action: zero xyz/rot delta with final gripper target")
+    elif args.control_mode == "delta_joint":
+        print("Action semantics: [target joint - current joint, target gripper]")
+        print("Terminal frame action: zero joint delta with final gripper target")
     else:
         print("Terminal frame action: clamped to final state")
     print(f"Episode retries: {args.episode_retries}")
