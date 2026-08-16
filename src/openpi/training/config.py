@@ -438,6 +438,7 @@ class LeRobotSimVisionDataConfig(DataConfigFactory):
 
     state_dim: int | None = None
     output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+    delta_joint_actions: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -462,6 +463,12 @@ class LeRobotSimVisionDataConfig(DataConfigFactory):
             inputs=[sim_policy.SimVisionInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
             outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
         )
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory(default_prompt=None)(model_config)
 
         return dataclasses.replace(
@@ -1465,6 +1472,63 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             state_dim=sim_policy.DELTA_EEF_STATE_DIM,
             output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_gelsight_sim_delta_joint_vision_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_usb_gelsight_delta_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.DELTA_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.DELTA_JOINT_ACTION_DIM,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_gelsight_sim_abs_joint_relative_action_vision_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_usb_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
