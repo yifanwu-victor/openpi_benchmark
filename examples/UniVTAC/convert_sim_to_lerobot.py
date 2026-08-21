@@ -6,11 +6,11 @@ to LeRobot datasets.
 Recommended usage from the OpenPI repo root:
 
     cd /home/tione/notebook/openpi_benchmark
-    export HF_LEROBOT_HOME=/home/tione/notebook/data/lerobot
+    export HF_LEROBOT_HOME=/run/ti/pi-training-data/lerobot
 
     uv run examples/UniVTAC/convert_sim_to_lerobot.py \
         --hdf5-dir /home/tione/notebook/data/UniVTAC/sim/insert_block \
-        --output-dir /home/tione/notebook/data/lerobot/simulation/insert_block_gelsight_delta_eef \
+        --output-dir /run/ti/pi-training-data/lerobot/simulation/insert_block_gelsight_delta_eef \
         --control-mode delta_eef \
         --overwrite
 
@@ -18,7 +18,7 @@ Pull Drawer delta EEF form:
 
     uv run examples/UniVTAC/convert_sim_to_lerobot.py \
         --hdf5-dir /home/tione/notebook/data/UniVTAC/sim/pull_drawer_GelSight \
-        --output-dir /home/tione/notebook/data/lerobot/simulation/pull_drawer_gelsight_delta_eef \
+        --output-dir /run/ti/pi-training-data/lerobot/simulation/pull_drawer_gelsight_delta_eef \
         --control-mode delta_eef \
         --overwrite
 
@@ -68,6 +68,7 @@ import argparse
 from collections.abc import Iterable
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import time
@@ -88,7 +89,7 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 
-DEFAULT_OUTPUT_ROOT = Path("/home/tione/notebook/data/lerobot")
+DEFAULT_OUTPUT_ROOT = Path(os.environ.get("HF_LEROBOT_HOME", "/run/ti/pi-training-data/lerobot"))
 DEFAULT_CONTROL_MODE = "delta_eef"
 DEFAULT_FPS = 60
 DEFAULT_IMAGE_SIZE = (224, 224)
@@ -156,7 +157,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
         help=(
             "Base LeRobot output directory used when --output-dir is omitted and for deriving "
-            "repo id from --output-dir. Default: /home/tione/notebook/data/lerobot"
+            f"repo id from --output-dir. Default: {DEFAULT_OUTPUT_ROOT}"
         ),
     )
     parser.add_argument(
@@ -165,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Exact local LeRobot dataset directory to write, e.g. "
-            "/home/tione/notebook/data/lerobot/simulation/pull_drawer_gelsight_delta_eef."
+            "/run/ti/pi-training-data/lerobot/simulation/pull_drawer_gelsight_delta_eef."
         ),
     )
     parser.add_argument(
