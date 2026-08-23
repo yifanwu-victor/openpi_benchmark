@@ -40,6 +40,7 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+import openpi.models.model
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
@@ -370,14 +371,19 @@ def train_loop(config: _config.TrainConfig):
 
         # Create sample images for wandb
         images_to_log = []
+        image_keys = [key for key in getattr(config.model, "image_keys", tuple(sample_batch["image"])) if key in sample_batch["image"]]
+        image_keys.extend(key for key in sample_batch["image"] if key not in image_keys)
         # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
+        batch_size = sample_batch["image"][image_keys[0]].shape[0]
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
             # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+            img_concatenated = torch.cat(
+                [sample_batch["image"][key][i].permute(1, 2, 0) for key in image_keys],
+                axis=1,
+            )
             img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+            images_to_log.append(wandb.Image(img_concatenated, caption=" | ".join(image_keys)))
 
         wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -400,6 +406,11 @@ def train_loop(config: _config.TrainConfig):
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            image_keys=getattr(config.model, "image_keys", openpi.models.model.IMAGE_KEYS),
+            separate_tactile_encoder=getattr(config.model, "separate_tactile_encoder", False),
+            tactile_image_keys=getattr(
+                config.model, "tactile_image_keys", ("left_tactile_0_rgb", "right_tactile_0_rgb")
+            ),
         )
     else:
         model_cfg = config.model
@@ -443,9 +454,23 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        missing, unexpected = safetensors.torch.load_model(
+            model_to_load, model_path, strict=not model_cfg.separate_tactile_encoder
         )
+        if model_cfg.separate_tactile_encoder:
+            model_to_load.paligemma_with_expert.init_tactile_encoder_from_vision_encoder()
+            tactile_missing = [name for name in missing if "tactile_" in name]
+            non_tactile_missing = [name for name in missing if "tactile_" not in name]
+            if non_tactile_missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected PyTorch checkpoint mismatch while loading dual-SigLIP model: "
+                    f"non_tactile_missing={non_tactile_missing[:20]}, unexpected={unexpected[:20]}"
+                )
+            logging.info(
+                "Initialized tactile SigLIP from loaded vision SigLIP; missing tactile tensors=%d",
+                len(tactile_missing),
+            )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config

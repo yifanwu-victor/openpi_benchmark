@@ -17,6 +17,12 @@ ABS_JOINT_ACTION_DIM = 8
 
 VISION_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 VISION_TACTILE_IMAGE_KEYS = ("base_0_rgb", "wrist_0_rgb", "left_tactile_0_rgb", "right_tactile_0_rgb")
+TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS = (
+    "left_tactile_0_rgb",
+    "right_tactile_0_rgb",
+    "base_0_rgb",
+    "wrist_0_rgb",
+)
 
 
 def _parse_image(image) -> np.ndarray:

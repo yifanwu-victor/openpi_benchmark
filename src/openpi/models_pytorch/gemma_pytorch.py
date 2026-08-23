@@ -1,3 +1,4 @@
+import copy
 from typing import Literal
 
 import torch
@@ -15,6 +16,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        separate_tactile_encoder: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -53,7 +55,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
+        self.separate_tactile_encoder = separate_tactile_encoder
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        if self.separate_tactile_encoder:
+            self.tactile_vision_tower = copy.deepcopy(self.paligemma.model.vision_tower)
+            self.tactile_multi_modal_projector = copy.deepcopy(self.paligemma.model.multi_modal_projector)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
@@ -83,6 +89,19 @@ class PaliGemmaWithExpertModel(nn.Module):
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
+
+    def init_tactile_encoder_from_vision_encoder(self):
+        if not self.separate_tactile_encoder:
+            return
+        self.tactile_vision_tower.load_state_dict(self.paligemma.model.vision_tower.state_dict())
+        self.tactile_multi_modal_projector.load_state_dict(self.paligemma.model.multi_modal_projector.state_dict())
+
+    def embed_tactile_image(self, image: torch.Tensor):
+        if not self.separate_tactile_encoder:
+            return self.embed_image(image)
+        image_outputs = self.tactile_vision_tower(image)
+        selected_image_feature = image_outputs.last_hidden_state
+        return self.tactile_multi_modal_projector(selected_image_feature)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
