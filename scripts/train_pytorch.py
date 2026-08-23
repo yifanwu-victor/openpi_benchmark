@@ -455,9 +455,8 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        missing, unexpected = safetensors.torch.load_model(
-            model_to_load, model_path, strict=not model_cfg.separate_tactile_encoder
-        )
+        allow_added_tactile_params = model_cfg.separate_tactile_encoder or model_cfg.tactile_encoder_type == "anytouch2"
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=not allow_added_tactile_params)
         if model_cfg.separate_tactile_encoder:
             model_to_load.paligemma_with_expert.init_tactile_encoder_from_vision_encoder()
             tactile_missing = [name for name in missing if "tactile_" in name]
@@ -471,6 +470,15 @@ def train_loop(config: _config.TrainConfig):
                 "Initialized tactile SigLIP from loaded vision SigLIP; missing tactile tensors=%d",
                 len(tactile_missing),
             )
+        elif model_cfg.tactile_encoder_type == "anytouch2":
+            anytouch_missing = [name for name in missing if "anytouch2_encoder" in name]
+            non_anytouch_missing = [name for name in missing if "anytouch2_encoder" not in name]
+            if non_anytouch_missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected PyTorch checkpoint mismatch while loading AnyTouch2 model: "
+                    f"non_anytouch_missing={non_anytouch_missing[:20]}, unexpected={unexpected[:20]}"
+                )
+            logging.info("Loaded base weights; AnyTouch2 tensors come from its checkpoint. missing=%d", len(anytouch_missing))
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config

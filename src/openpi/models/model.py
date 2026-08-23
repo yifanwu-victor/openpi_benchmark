@@ -117,7 +117,10 @@ class Observation(Generic[ArrayT]):
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                image = data["image"][key].to(torch.float32)
+                if image.ndim == 4:
+                    image = image.permute(0, 3, 1, 2)
+                data["image"][key] = image / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],

@@ -36,6 +36,11 @@ def preprocess_observation_pytorch(
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
+        if image.ndim == 5:
+            # Tactile clip path, e.g. [B, T, H, W, C]. AnyTouch2 performs its
+            # own resize/normalization, so only pass the clip through here.
+            out_images[key] = image
+            continue
 
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats

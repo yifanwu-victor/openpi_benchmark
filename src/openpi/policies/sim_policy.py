@@ -34,6 +34,19 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _parse_tactile_clip(clip) -> np.ndarray:
+    clip = np.asarray(clip)
+    if np.issubdtype(clip.dtype, np.floating):
+        clip = (255 * clip).astype(np.uint8)
+    if clip.ndim != 4:
+        raise ValueError(f"Expected tactile clip shape [T, H, W, 3] or [T, 3, H, W], got {clip.shape}.")
+    if clip.shape[1] == 3:
+        clip = einops.rearrange(clip, "t c h w -> t h w c")
+    if clip.shape[-1] != 3:
+        raise ValueError(f"Expected tactile clip channel dim 3, got {clip.shape}.")
+    return clip
+
+
 def _parse_prompt(data: dict) -> str:
     if "prompt" not in data:
         raise ValueError("Sim policy requires a top-level 'prompt' field in every observation.")
@@ -114,6 +127,40 @@ class SimVisionTactileInputs(transforms.DataTransformFn):
                 image_masks = (np.True_, np.True_, np.True_, np.True_)
             case _:
                 raise ValueError(f"Unsupported model type for sim vision+tactile policy: {self.model_type}")
+
+        inputs = {
+            "state": _parse_state(data["observation/state"], self.state_dim),
+            "image": dict(zip(names, images, strict=True)),
+            "image_mask": dict(zip(names, image_masks, strict=True)),
+            "prompt": _parse_prompt(data),
+        }
+
+        if "actions" in data:
+            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class SimVisionTactileClipInputs(transforms.DataTransformFn):
+    """Map sim visual observations plus AnyTouch-style tactile clips."""
+
+    model_type: _model.ModelType
+    state_dim: int | None = None
+
+    def __call__(self, data: dict) -> dict:
+        base_image = _parse_image(data["observation/image"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+        left_tactile_clip = _parse_tactile_clip(data["observation/left_tactile_clip"])
+        right_tactile_clip = _parse_tactile_clip(data["observation/right_tactile_clip"])
+
+        match self.model_type:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                names = TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS
+                images = (left_tactile_clip, right_tactile_clip, base_image, wrist_image)
+                image_masks = (np.True_, np.True_, np.True_, np.True_)
+            case _:
+                raise ValueError(f"Unsupported model type for sim vision+tactile clip policy: {self.model_type}")
 
         inputs = {
             "state": _parse_state(data["observation/state"], self.state_dim),
