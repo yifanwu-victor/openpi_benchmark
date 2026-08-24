@@ -106,7 +106,7 @@ PY
 NORM_STATS_DIR="${REPO_ROOT}/assets/${CONFIG_NAME}/${REPO_ID}"
 if [[ "$FORCE_NORM_STATS" == "1" || ! -d "$NORM_STATS_DIR" ]]; then
   echo "[norm-stats] computing stats for ${CONFIG_NAME}"
-  uv run scripts/compute_norm_stats.py --config-name "$CONFIG_NAME"
+  uv run scripts/compute_norm_stats_lerobot_fast.py --config-name "$CONFIG_NAME"
 else
   echo "[norm-stats] found ${NORM_STATS_DIR}; set FORCE_NORM_STATS=1 to recompute"
 fi

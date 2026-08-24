@@ -41,6 +41,12 @@ def preprocess_observation_pytorch(
             # own resize/normalization, so only pass the clip through here.
             out_images[key] = image
             continue
+        if image.ndim == 4 and (image.shape[1] == 6 or image.shape[-1] == 6):
+            # Sparsh DINOv2 tactile path, e.g. [B, H, W, 6] or [B, 6, H, W].
+            # Sparsh performs its own resize/normalization, so keep this out of
+            # the RGB camera augmentation path.
+            out_images[key] = image
+            continue
 
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats

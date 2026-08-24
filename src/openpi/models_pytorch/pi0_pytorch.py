@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.models_pytorch.anytouch2 import AnyTouch2TactileEncoder
+from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -114,6 +115,17 @@ class PI0Pytorch(nn.Module):
             )
         else:
             self.anytouch2_encoder = None
+        if self.tactile_encoder_type == "sparsh_dinov2":
+            self.sparsh_encoder = SparshDINOv2TactileEncoder(
+                model_name_or_path=config.sparsh_model_name_or_path,
+                trainable=config.sparsh_trainable,
+                keep_register_tokens=config.sparsh_keep_register_tokens,
+                patch_tokens_per_side=config.sparsh_patch_tokens_per_side,
+                output_dim=paligemma_config.width,
+                dtype=getattr(torch, config.dtype),
+            )
+        else:
+            self.sparsh_encoder = None
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
@@ -151,6 +163,8 @@ class PI0Pytorch(nn.Module):
             self.paligemma_with_expert.tactile_vision_tower.gradient_checkpointing = True
         if self.anytouch2_encoder is not None:
             self.anytouch2_encoder.encoder.touch_model.gradient_checkpointing = True
+        if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_enable"):
+            self.sparsh_encoder.encoder.gradient_checkpointing_enable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
@@ -164,6 +178,8 @@ class PI0Pytorch(nn.Module):
             self.paligemma_with_expert.tactile_vision_tower.gradient_checkpointing = False
         if self.anytouch2_encoder is not None:
             self.anytouch2_encoder.encoder.touch_model.gradient_checkpointing = False
+        if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_disable"):
+            self.sparsh_encoder.encoder.gradient_checkpointing_disable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
@@ -230,6 +246,8 @@ class PI0Pytorch(nn.Module):
             def image_embed_func(img, use_tactile_encoder=use_tactile_encoder):
                 if use_tactile_encoder and self.tactile_encoder_type == "anytouch2":
                     return self.anytouch2_encoder(img)
+                if use_tactile_encoder and self.tactile_encoder_type == "sparsh_dinov2":
+                    return self.sparsh_encoder(img)
                 if use_tactile_encoder:
                     return self.paligemma_with_expert.embed_tactile_image(img)
                 return self.paligemma_with_expert.embed_image(img)

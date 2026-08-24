@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 
-DEFAULT_KEYS = ("left_tactile_clip", "right_tactile_clip")
+DEFAULT_KEYS = ("left_tactile_clip", "right_tactile_clip", "left_tactile_sparsh", "right_tactile_sparsh")
 
 
 def parse_args() -> argparse.Namespace:
