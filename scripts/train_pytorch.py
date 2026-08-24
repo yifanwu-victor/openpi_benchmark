@@ -40,6 +40,7 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+import openpi.models.model
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
@@ -328,7 +329,7 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif is_main and config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
@@ -336,11 +337,15 @@ def train_loop(config: _config.TrainConfig):
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -370,14 +375,30 @@ def train_loop(config: _config.TrainConfig):
 
         # Create sample images for wandb
         images_to_log = []
+        image_keys = [key for key in getattr(config.model, "image_keys", tuple(sample_batch["image"])) if key in sample_batch["image"]]
+        image_keys.extend(key for key in sample_batch["image"] if key not in image_keys)
         # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
+        batch_size = sample_batch["image"][image_keys[0]].shape[0]
+        def _image_for_wandb(image: torch.Tensor) -> torch.Tensor:
+            if image.ndim == 4:
+                # AnyTouch-style [T, C, H, W] / [T, H, W, C]: show the most
+                # recent frame in the clip for quick visual sanity checks.
+                image = image[-1]
+            if image.ndim != 3:
+                raise ValueError(f"Unsupported image shape for W&B logging: {tuple(image.shape)}")
+            if image.shape[0] in (3, 6):
+                image = image.permute(1, 2, 0)
+            if image.shape[-1] == 6:
+                image = torch.cat([image[..., :3], image[..., 3:]], dim=1)
+            if image.shape[-1] != 3:
+                raise ValueError(f"Unsupported image channel count for W&B logging: {tuple(image.shape)}")
+            return image
+
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+            img_concatenated = torch.cat([_image_for_wandb(sample_batch["image"][key][i]) for key in image_keys], axis=1)
             img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+            images_to_log.append(wandb.Image(img_concatenated, caption=" | ".join(image_keys)))
 
         wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -400,6 +421,11 @@ def train_loop(config: _config.TrainConfig):
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            image_keys=getattr(config.model, "image_keys", openpi.models.model.IMAGE_KEYS),
+            separate_tactile_encoder=getattr(config.model, "separate_tactile_encoder", False),
+            tactile_image_keys=getattr(
+                config.model, "tactile_image_keys", ("left_tactile_0_rgb", "right_tactile_0_rgb")
+            ),
         )
     else:
         model_cfg = config.model
@@ -443,9 +469,46 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        allow_added_tactile_params = model_cfg.separate_tactile_encoder or model_cfg.tactile_encoder_type in (
+            "anytouch2",
+            "sparsh_dinov2",
         )
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=not allow_added_tactile_params)
+        if model_cfg.separate_tactile_encoder:
+            model_to_load.paligemma_with_expert.init_tactile_encoder_from_vision_encoder()
+            tactile_missing = [name for name in missing if "tactile_" in name]
+            non_tactile_missing = [name for name in missing if "tactile_" not in name]
+            if non_tactile_missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected PyTorch checkpoint mismatch while loading dual-SigLIP model: "
+                    f"non_tactile_missing={non_tactile_missing[:20]}, unexpected={unexpected[:20]}"
+                )
+            logging.info(
+                "Initialized tactile SigLIP from loaded vision SigLIP; missing tactile tensors=%d",
+                len(tactile_missing),
+            )
+        elif model_cfg.tactile_encoder_type == "anytouch2":
+            anytouch_missing = [name for name in missing if "anytouch2_encoder" in name]
+            non_anytouch_missing = [name for name in missing if "anytouch2_encoder" not in name]
+            if non_anytouch_missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected PyTorch checkpoint mismatch while loading AnyTouch2 model: "
+                    f"non_anytouch_missing={non_anytouch_missing[:20]}, unexpected={unexpected[:20]}"
+                )
+            logging.info("Loaded base weights; AnyTouch2 tensors come from its checkpoint. missing=%d", len(anytouch_missing))
+        elif model_cfg.tactile_encoder_type == "sparsh_dinov2":
+            sparsh_missing = [name for name in missing if "sparsh_encoder" in name]
+            non_sparsh_missing = [name for name in missing if "sparsh_encoder" not in name]
+            if non_sparsh_missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected PyTorch checkpoint mismatch while loading Sparsh DINOv2 model: "
+                    f"non_sparsh_missing={non_sparsh_missing[:20]}, unexpected={unexpected[:20]}"
+                )
+            logging.info(
+                "Loaded base weights; Sparsh DINOv2 tensors come from its own checkpoint. missing=%d",
+                len(sparsh_missing),
+            )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config

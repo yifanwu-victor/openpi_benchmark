@@ -486,6 +486,7 @@ class LeRobotSimVisionTactileDataConfig(DataConfigFactory):
 
     state_dim: int | None = None
     output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+    delta_joint_actions: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -514,6 +515,12 @@ class LeRobotSimVisionTactileDataConfig(DataConfigFactory):
             inputs=[sim_policy.SimVisionTactileInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
             outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
         )
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory(default_prompt=None)(model_config)
 
         return dataclasses.replace(
@@ -521,6 +528,158 @@ class LeRobotSimVisionTactileDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            prompt_required=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSimVisionTactileClipDataConfig(DataConfigFactory):
+    """Data config for UniVTAC sim policies with AnyTouch-style tactile clips."""
+
+    state_dim: int | None = None
+    output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+    delta_joint_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        if not base_config.prompt_from_task:
+            raise ValueError(
+                "LeRobotSimVisionTactileClipDataConfig requires base_config=DataConfig(prompt_from_task=True)."
+            )
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/left_tactile_clip": "left_tactile_clip",
+                        "observation/right_tactile_clip": "right_tactile_clip",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                sim_policy.SimVisionTactileClipInputs(
+                    model_type=model_config.model_type,
+                    state_dim=self.state_dim,
+                )
+            ],
+            outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        match model_config.model_type:
+            case _model.ModelType.PI0:
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _model.ModelType.PI05:
+                assert isinstance(model_config, pi0_config.Pi0Config)
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _:
+                raise ValueError(f"Unsupported model type for tactile clips: {model_config.model_type}")
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=_transforms.Group(inputs=model_inputs),
+            prompt_required=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSimVisionTactileSparshDataConfig(DataConfigFactory):
+    """Data config for UniVTAC sim policies with Sparsh two-frame 6-channel tactile inputs."""
+
+    state_dim: int | None = None
+    output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+    delta_joint_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        if not base_config.prompt_from_task:
+            raise ValueError(
+                "LeRobotSimVisionTactileSparshDataConfig requires base_config=DataConfig(prompt_from_task=True)."
+            )
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/left_tactile_sparsh": "left_tactile_sparsh",
+                        "observation/right_tactile_sparsh": "right_tactile_sparsh",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                sim_policy.SimVisionTactileSparshInputs(
+                    model_type=model_config.model_type,
+                    state_dim=self.state_dim,
+                )
+            ],
+            outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        match model_config.model_type:
+            case _model.ModelType.PI0:
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _model.ModelType.PI05:
+                assert isinstance(model_config, pi0_config.Pi0Config)
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _:
+                raise ValueError(f"Unsupported model type for Sparsh tactile inputs: {model_config.model_type}")
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=_transforms.Group(inputs=model_inputs),
             prompt_required=True,
         )
 
@@ -886,7 +1045,7 @@ _CONFIGS = [
         ),
         # Note that we load the pi0-FAST base model checkpoint here.
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=20_000,
+        num_train_steps=10_000,
     ),
     TrainConfig(
         name="pi0_fast_libero_low_mem_finetune",
@@ -1415,7 +1574,7 @@ _CONFIGS = [
             state_dim=sim_policy.DELTA_EEF_STATE_DIM,
             output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
         ),
-        batch_size=64,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
             peak_lr=5e-5,
@@ -1445,7 +1604,7 @@ _CONFIGS = [
             state_dim=sim_policy.DELTA_EEF_STATE_DIM,
             output_action_dim=sim_policy.DELTA_EEF_ACTION_DIM,
         ),
-        batch_size=64,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
             peak_lr=5e-5,
@@ -1637,6 +1796,200 @@ _CONFIGS = [
         save_interval=5_000,
         keep_period=5_000,
         fsdp_devices=4,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v2_gelsight_sim_abs_joint_relative_action_vision_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_usb_v2_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_dual_siglip_torch_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.VISION_TACTILE_IMAGE_KEYS,
+            separate_tactile_encoder=True,
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/shareNFS_40/wyf/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_dual_siglip_tactile_first_torch_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            separate_tactile_encoder=True,
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/shareNFS_40/wyf/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            tactile_encoder_type="anytouch2",
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+            anytouch_checkpoint_path="/shareNFS_40/wyf/workplace/AnyTouch2/checkpoints/anytouch2.pth",
+            anytouch_num_frames=4,
+            anytouch_stride=2,
+            anytouch_sensor_id=0,
+            anytouch_trainable=True,
+            anytouch_keep_cls_sensor_tokens=True,
+            anytouch_patch_tokens_per_side=30,
+        ),
+        data=LeRobotSimVisionTactileClipDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint_anytouch2_clip",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/shareNFS_40/wyf/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_sparsh_dinov2_torch_full_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.SPARSH_TACTILE_FIRST_IMAGE_KEYS,
+            tactile_encoder_type="sparsh_dinov2",
+            tactile_image_keys=("left_tactile_sparsh", "right_tactile_sparsh"),
+            sparsh_model_name_or_path="facebook/sparsh-dinov2-base",
+            sparsh_in_chans=6,
+            sparsh_frame_offsets=(-5, 0),
+            sparsh_trainable=True,
+            sparsh_keep_register_tokens=True,
+            sparsh_patch_tokens_per_side=30,
+        ),
+        data=LeRobotSimVisionTactileSparshDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint_sparsh_2f",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/shareNFS_40/wyf/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
     ),
     TrainConfig(
         name="pi05_pull_drawer_sim_delta_eef_vision_lora",

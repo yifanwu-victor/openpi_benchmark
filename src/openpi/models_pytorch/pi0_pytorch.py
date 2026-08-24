@@ -8,6 +8,8 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.anytouch2 import AnyTouch2TactileEncoder
+from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -95,7 +97,35 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            separate_tactile_encoder=config.separate_tactile_encoder,
         )
+        self.tactile_image_keys = set(config.tactile_image_keys)
+        self.tactile_encoder_type = config.tactile_encoder_type
+        if self.tactile_encoder_type == "anytouch2":
+            self.anytouch2_encoder = AnyTouch2TactileEncoder(
+                checkpoint_path=config.anytouch_checkpoint_path,
+                num_frames=config.anytouch_num_frames,
+                stride=config.anytouch_stride,
+                sensor_id=config.anytouch_sensor_id,
+                trainable=config.anytouch_trainable,
+                keep_cls_sensor_tokens=config.anytouch_keep_cls_sensor_tokens,
+                patch_tokens_per_side=config.anytouch_patch_tokens_per_side,
+                output_dim=paligemma_config.width,
+                dtype=getattr(torch, config.dtype),
+            )
+        else:
+            self.anytouch2_encoder = None
+        if self.tactile_encoder_type == "sparsh_dinov2":
+            self.sparsh_encoder = SparshDINOv2TactileEncoder(
+                model_name_or_path=config.sparsh_model_name_or_path,
+                trainable=config.sparsh_trainable,
+                keep_register_tokens=config.sparsh_keep_register_tokens,
+                patch_tokens_per_side=config.sparsh_patch_tokens_per_side,
+                output_dim=paligemma_config.width,
+                dtype=getattr(torch, config.dtype),
+            )
+        else:
+            self.sparsh_encoder = None
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
@@ -129,6 +159,12 @@ class PI0Pytorch(nn.Module):
         self.gradient_checkpointing_enabled = True
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        if self.config.separate_tactile_encoder:
+            self.paligemma_with_expert.tactile_vision_tower.gradient_checkpointing = True
+        if self.anytouch2_encoder is not None:
+            self.anytouch2_encoder.encoder.touch_model.gradient_checkpointing = True
+        if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_enable"):
+            self.sparsh_encoder.encoder.gradient_checkpointing_enable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
@@ -138,6 +174,12 @@ class PI0Pytorch(nn.Module):
         self.gradient_checkpointing_enabled = False
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        if self.config.separate_tactile_encoder:
+            self.paligemma_with_expert.tactile_vision_tower.gradient_checkpointing = False
+        if self.anytouch2_encoder is not None:
+            self.anytouch2_encoder.encoder.touch_model.gradient_checkpointing = False
+        if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_disable"):
+            self.sparsh_encoder.encoder.gradient_checkpointing_disable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
@@ -161,10 +203,12 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation, train=train, image_keys=self.config.image_keys
+        )
         return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
+            list(observation.images.items()),
+            observation.image_masks,
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
@@ -185,7 +229,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, image_items, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -195,9 +239,17 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for image_key, img in image_items:
+            img_mask = img_masks[image_key]
+            use_tactile_encoder = image_key in self.tactile_image_keys
 
-            def image_embed_func(img):
+            def image_embed_func(img, use_tactile_encoder=use_tactile_encoder):
+                if use_tactile_encoder and self.tactile_encoder_type == "anytouch2":
+                    return self.anytouch2_encoder(img)
+                if use_tactile_encoder and self.tactile_encoder_type == "sparsh_dinov2":
+                    return self.sparsh_encoder(img)
+                if use_tactile_encoder:
+                    return self.paligemma_with_expert.embed_tactile_image(img)
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)

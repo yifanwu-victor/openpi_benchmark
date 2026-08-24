@@ -1,7 +1,12 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
+
+# Serve usually benefits from allocating GPU memory on demand instead of
+# preallocating most of the visible device at startup.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import tyro
 

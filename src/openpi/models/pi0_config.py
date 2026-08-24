@@ -26,6 +26,22 @@ class Pi0Config(_model.BaseModelConfig):
     action_horizon: int = 50
     max_token_len: int = None  # type: ignore
     image_keys: tuple[str, ...] = _model.IMAGE_KEYS
+    separate_tactile_encoder: bool = False
+    tactile_image_keys: tuple[str, ...] = ("left_tactile_0_rgb", "right_tactile_0_rgb")
+    tactile_encoder_type: str = "siglip"
+    anytouch_checkpoint_path: str | None = None
+    anytouch_num_frames: int = 4
+    anytouch_stride: int = 2
+    anytouch_sensor_id: int = 0
+    anytouch_trainable: bool = True
+    anytouch_keep_cls_sensor_tokens: bool = True
+    anytouch_patch_tokens_per_side: int = 30
+    sparsh_model_name_or_path: str = "facebook/sparsh-dinov2-base"
+    sparsh_in_chans: int = 6
+    sparsh_frame_offsets: tuple[int, int] = (-5, 0)
+    sparsh_trainable: bool = True
+    sparsh_keep_register_tokens: bool = True
+    sparsh_patch_tokens_per_side: int = 30
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
@@ -47,6 +63,8 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.tactile_encoder_type not in ("siglip", "anytouch2", "sparsh_dinov2"):
+            raise ValueError(f"Unsupported tactile_encoder_type: {self.tactile_encoder_type}")
 
     @property
     @override
@@ -64,11 +82,26 @@ class Pi0Config(_model.BaseModelConfig):
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        tactile_clip_spec = jax.ShapeDtypeStruct(
+            [batch_size, self.anytouch_num_frames, *_model.IMAGE_RESOLUTION, 3],
+            jnp.float32,
+        )
+        tactile_sparsh_spec = jax.ShapeDtypeStruct(
+            [batch_size, *_model.IMAGE_RESOLUTION, self.sparsh_in_chans],
+            jnp.float32,
+        )
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={key: image_spec for key in self.image_keys},
+                images={
+                    key: tactile_clip_spec
+                    if self.tactile_encoder_type == "anytouch2" and key in self.tactile_image_keys
+                    else tactile_sparsh_spec
+                    if self.tactile_encoder_type == "sparsh_dinov2" and key in self.tactile_image_keys
+                    else image_spec
+                    for key in self.image_keys
+                },
                 image_masks={key: image_mask_spec for key in self.image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
