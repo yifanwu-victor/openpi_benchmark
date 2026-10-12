@@ -7,10 +7,10 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.models_pytorch.anytouch2 import AnyTouch2TactileEncoder
-from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
+from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
 
 
 def get_safe_dtype(target_dtype, device_type):

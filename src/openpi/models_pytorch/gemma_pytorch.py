@@ -1,3 +1,5 @@
+# Preserve the upstream constructor signature.
+# ruff: noqa: FBT001, FBT002
 import copy
 from typing import Literal
 

@@ -24,6 +24,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
+        self._reset_pending = False
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -45,6 +46,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
+        if self._reset_pending:
+            obs = dict(obs)
+            obs["reset"] = True
+            self._reset_pending = False
         data = self._packer.pack(obs)
         self._ws.send(data)
         response = self._ws.recv()
@@ -55,4 +60,4 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     @override
     def reset(self) -> None:
-        pass
+        self._reset_pending = True

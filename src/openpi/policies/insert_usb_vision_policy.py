@@ -6,7 +6,6 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 
-
 ABS_EEF_ACTION_DIM = 10
 ABS_JOINT_ACTION_DIM = 8
 DELTA_EEF_STATE_DIM = 8

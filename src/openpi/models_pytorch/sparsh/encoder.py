@@ -39,7 +39,7 @@ class SparshDINOv2TactileEncoder(nn.Module):
 
         self.to(dtype=dtype)
         if not trainable:
-            self.requires_grad_(False)
+            self.requires_grad_(requires_grad=False)
 
     def _prepare_image(self, image: torch.Tensor) -> torch.Tensor:
         if image.ndim != 4:
@@ -78,8 +78,5 @@ class SparshDINOv2TactileEncoder(nn.Module):
         # DINOv2-style output is usually CLS/register token(s) followed by patch tokens.
         prefix_tokens = tokens[:, :1]
         patch_tokens = self._compress_patch_tokens(tokens[:, 1:])
-        if self.keep_register_tokens:
-            tokens = torch.cat([prefix_tokens, patch_tokens], dim=1)
-        else:
-            tokens = patch_tokens
+        tokens = torch.cat([prefix_tokens, patch_tokens], dim=1) if self.keep_register_tokens else patch_tokens
         return self.projector(tokens.to(dtype=self.projector.weight.dtype))

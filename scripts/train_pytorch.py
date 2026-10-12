@@ -333,6 +333,15 @@ def train_loop(config: _config.TrainConfig):
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
+    if not config.resume and not config.overwrite:
+        # Rank 0 decides before creating the directory, avoiding a race where
+        # slower ranks mistake this run's new directory for a previous run.
+        directory_exists = [config.checkpoint_dir.exists() if is_main else False]
+        if use_ddp:
+            dist.broadcast_object_list(directory_exists, src=0)
+        if directory_exists[0]:
+            raise FileExistsError(f"{config.checkpoint_dir} exists; use --resume or choose a new --exp-name")
+
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
@@ -355,6 +364,8 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
+    if config.batch_size % world_size != 0:
+        raise ValueError("Global batch size must be divisible by the DDP world size.")
     effective_batch_size = config.batch_size // world_size
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
@@ -375,10 +386,15 @@ def train_loop(config: _config.TrainConfig):
 
         # Create sample images for wandb
         images_to_log = []
-        image_keys = [key for key in getattr(config.model, "image_keys", tuple(sample_batch["image"])) if key in sample_batch["image"]]
+        image_keys = [
+            key
+            for key in getattr(config.model, "image_keys", tuple(sample_batch["image"]))
+            if key in sample_batch["image"]
+        ]
         image_keys.extend(key for key in sample_batch["image"] if key not in image_keys)
         # Get batch size from the first image tensor
         batch_size = sample_batch["image"][image_keys[0]].shape[0]
+
         def _image_for_wandb(image: torch.Tensor) -> torch.Tensor:
             if image.ndim == 4:
                 # AnyTouch-style [T, C, H, W] / [T, H, W, C]: show the most
@@ -396,7 +412,9 @@ def train_loop(config: _config.TrainConfig):
 
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
-            img_concatenated = torch.cat([_image_for_wandb(sample_batch["image"][key][i]) for key in image_keys], axis=1)
+            img_concatenated = torch.cat(
+                [_image_for_wandb(sample_batch["image"][key][i]) for key in image_keys], axis=1
+            )
             img_concatenated = img_concatenated.cpu().numpy()
             images_to_log.append(wandb.Image(img_concatenated, caption=" | ".join(image_keys)))
 
@@ -465,7 +483,7 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
+    if config.pytorch_weight_path is not None and not resuming:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
@@ -474,7 +492,9 @@ def train_loop(config: _config.TrainConfig):
             "anytouch2",
             "sparsh_dinov2",
         )
-        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=not allow_added_tactile_params)
+        missing, unexpected = safetensors.torch.load_model(
+            model_to_load, model_path, strict=not allow_added_tactile_params
+        )
         if model_cfg.separate_tactile_encoder:
             model_to_load.paligemma_with_expert.init_tactile_encoder_from_vision_encoder()
             tactile_missing = [name for name in missing if "tactile_" in name]
@@ -496,7 +516,9 @@ def train_loop(config: _config.TrainConfig):
                     "Unexpected PyTorch checkpoint mismatch while loading AnyTouch2 model: "
                     f"non_anytouch_missing={non_anytouch_missing[:20]}, unexpected={unexpected[:20]}"
                 )
-            logging.info("Loaded base weights; AnyTouch2 tensors come from its checkpoint. missing=%d", len(anytouch_missing))
+            logging.info(
+                "Loaded base weights; AnyTouch2 tensors come from its checkpoint. missing=%d", len(anytouch_missing)
+            )
         elif model_cfg.tactile_encoder_type == "sparsh_dinov2":
             sparsh_missing = [name for name in missing if "sparsh_encoder" in name]
             non_sparsh_missing = [name for name in missing if "sparsh_encoder" not in name]

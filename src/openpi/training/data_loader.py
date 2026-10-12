@@ -138,11 +138,18 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    for key, offsets in data_config.observation_history_offsets.items():
+        if key in delta_timestamps:
+            raise ValueError(f"Observation history key conflicts with action sequence key: {key}")
+        if not offsets:
+            raise ValueError(f"Observation history offsets cannot be empty for key: {key}")
+        delta_timestamps[key] = [offset / dataset_meta.fps for offset in offsets]
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:
@@ -319,9 +326,26 @@ def create_torch_data_loader(
         else:
             local_batch_size = batch_size
     else:
-        local_batch_size = batch_size // jax.process_count()
+        process_count = jax.process_count()
+        if batch_size % process_count != 0:
+            raise ValueError(f"Batch size {batch_size} must be divisible by JAX process count {process_count}.")
+        local_batch_size = batch_size // process_count
+        if process_count > 1:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=process_count,
+                rank=jax.process_index(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
 
-    logging.info(f"local_batch_size: {local_batch_size}")
+    logging.info(
+        "local_batch_size: %s; jax_process=%s/%s; sampler=%s",
+        local_batch_size,
+        jax.process_index(),
+        jax.process_count(),
+        type(sampler).__name__ if sampler is not None else None,
+    )
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
@@ -409,14 +433,15 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        if local_batch_size <= 0:
+            raise ValueError(f"Local batch size must be positive, got {local_batch_size}.")
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
+        self._sampler = sampler
         if sharding is None and framework == "jax":
             # Use data parallel sharding by default for JAX only.
             self._sharding = jax.sharding.NamedSharding(
@@ -451,7 +476,10 @@ class TorchDataLoader:
 
     def __iter__(self):
         num_items = 0
+        epoch = 0
         while True:
+            if self._sampler is not None and hasattr(self._sampler, "set_epoch"):
+                self._sampler.set_epoch(epoch)
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -466,6 +494,7 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+            epoch += 1
 
 
 def _collate_fn(items):

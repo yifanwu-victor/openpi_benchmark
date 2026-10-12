@@ -86,8 +86,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
+def compute(config: _config.TrainConfig, max_frames: int | None = None):
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -98,6 +97,9 @@ def main(config_name: str, max_frames: int | None = None):
         data_loader, num_batches = create_torch_dataloader(
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
+
+    if num_batches < 1:
+        raise ValueError("Dataset/max_frames is smaller than batch_size; reduce batch_size.")
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
@@ -111,6 +113,10 @@ def main(config_name: str, max_frames: int | None = None):
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
+
+
+def main(config_name: str, max_frames: int | None = None):
+    compute(_config.get_config(config_name), max_frames)
 
 
 if __name__ == "__main__":

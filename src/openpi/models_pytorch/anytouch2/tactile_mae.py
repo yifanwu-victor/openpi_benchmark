@@ -1,3 +1,5 @@
+# Transformers callback signatures retain positional boolean defaults.
+# ruff: noqa: FBT002
 from types import SimpleNamespace
 
 import torch
@@ -10,9 +12,8 @@ from transformers.models.clip.modeling_clip import CLIPVisionTransformer
 class TactileVideoMAE(nn.Module):
     """Minimal AnyTouch2 tactile VideoMAE encoder.
 
-    This is adapted from `/shareNFS_40/wyf/workplace/AnyTouch2/model/tactile_mae.py`
-    and kept local so OpenPI experiments do not depend on that repository being on
-    `PYTHONPATH`.
+    This is kept local so OpenPI experiments do not depend on the original
+    AnyTouch2 repository being on `PYTHONPATH`.
     """
 
     def __init__(self, config, num_frames: int = 4, stride: int = 2, mask_ratio: float = 0.0):
@@ -67,7 +68,9 @@ class TactileVideoMAE(nn.Module):
         probe=False,
     ):
         del use_mask, probe
-        output_attentions = output_attentions if output_attentions is not None else self.touch_model.config.output_attentions
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.touch_model.config.output_attentions
+        )
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.touch_model.config.output_hidden_states
         )
@@ -142,11 +145,7 @@ def load_anytouch2_checkpoint(checkpoint_path: str, model: TactileVideoMAE) -> N
 
     if not state:
         # Some exported checkpoints may already be the encoder state dict.
-        state = {
-            key: value
-            for key, value in ckpt.items()
-            if "decoder" not in key and "mask_token" not in key
-        }
+        state = {key: value for key, value in ckpt.items() if "decoder" not in key and "mask_token" not in key}
 
     current = model.state_dict()
     merged = {key: state.get(key, value) for key, value in current.items()}

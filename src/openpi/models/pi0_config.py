@@ -102,7 +102,7 @@ class Pi0Config(_model.BaseModelConfig):
                     else image_spec
                     for key in self.image_keys
                 },
-                image_masks={key: image_mask_spec for key in self.image_keys},
+                image_masks=dict.fromkeys(self.image_keys, image_mask_spec),
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

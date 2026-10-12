@@ -4,7 +4,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-from openpi.models_pytorch.anytouch2.tactile_mae import TactileVideoMAE, load_anytouch2_checkpoint
+from openpi.models_pytorch.anytouch2.tactile_mae import TactileVideoMAE
+from openpi.models_pytorch.anytouch2.tactile_mae import load_anytouch2_checkpoint
 
 
 class AnyTouch2TactileEncoder(nn.Module):
@@ -53,7 +54,7 @@ class AnyTouch2TactileEncoder(nn.Module):
 
         self.to(dtype=dtype)
         if not trainable:
-            self.requires_grad_(False)
+            self.requires_grad_(requires_grad=False)
 
     def _prepare_clip(self, clip: torch.Tensor) -> torch.Tensor:
         if clip.ndim != 5:
@@ -101,8 +102,5 @@ class AnyTouch2TactileEncoder(nn.Module):
         tokens = self.encoder(clip, sensor_type=sensor_type)
         cls_and_sensor = tokens[:, :6]
         patch_tokens = self._compress_patch_tokens(tokens[:, 6:])
-        if self.keep_cls_sensor_tokens:
-            tokens = torch.cat([cls_and_sensor, patch_tokens], dim=1)
-        else:
-            tokens = patch_tokens
+        tokens = torch.cat([cls_and_sensor, patch_tokens], dim=1) if self.keep_cls_sensor_tokens else patch_tokens
         return self.projector(tokens.to(dtype=self.projector.weight.dtype))
