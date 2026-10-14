@@ -138,11 +138,18 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    for key, offsets in data_config.observation_history_offsets.items():
+        if key in delta_timestamps:
+            raise ValueError(f"Observation history key conflicts with action sequence key: {key}")
+        if not offsets:
+            raise ValueError(f"Observation history offsets cannot be empty for key: {key}")
+        delta_timestamps[key] = [offset / dataset_meta.fps for offset in offsets]
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:

@@ -90,6 +90,8 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    observation_history_offsets: dict[str, Sequence[int]] = dataclasses.field(default_factory=dict)
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
     # If true, serving requires the client to send a top-level "prompt" field.
@@ -512,7 +514,13 @@ class LeRobotSimVisionTactileDataConfig(DataConfigFactory):
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[sim_policy.SimVisionTactileInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
+            inputs=[
+                sim_policy.SimVisionTactileInputs(
+                    model_type=model_config.model_type,
+                    state_dim=self.state_dim,
+                    image_keys=getattr(model_config, "image_keys", sim_policy.VISION_TACTILE_IMAGE_KEYS),
+                )
+            ],
             outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
         )
         if self.delta_joint_actions:
@@ -601,6 +609,91 @@ class LeRobotSimVisionTactileClipDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=_transforms.Group(inputs=model_inputs),
+            prompt_required=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSimVisionTactileHistoryDataConfig(DataConfigFactory):
+    """Data config for single-frame sim tactile data with lazy AnyTouch histories."""
+
+    state_dim: int | None = None
+    output_action_dim: int = sim_policy.DELTA_EEF_ACTION_DIM
+    delta_joint_actions: bool = False
+    tactile_history_offsets: tuple[int, ...] = (-6, -4, -2, 0)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        if not base_config.prompt_from_task:
+            raise ValueError(
+                "LeRobotSimVisionTactileHistoryDataConfig requires base_config=DataConfig(prompt_from_task=True)."
+            )
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/left_tactile_clip": "left_tactile_image",
+                        "observation/right_tactile_clip": "right_tactile_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                sim_policy.SimVisionTactileClipInputs(
+                    model_type=model_config.model_type,
+                    state_dim=self.state_dim,
+                )
+            ],
+            outputs=[sim_policy.SimOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        match model_config.model_type:
+            case _model.ModelType.PI0:
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _model.ModelType.PI05:
+                assert isinstance(model_config, pi0_config.Pi0Config)
+                model_inputs = [
+                    _transforms.InjectDefaultPrompt(None),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+            case _:
+                raise ValueError(f"Unsupported model type for tactile histories: {model_config.model_type}")
+
+        data_config = self.create_base_config(assets_dirs, model_config)
+        data_config = dataclasses.replace(
+            data_config,
+            observation_history_offsets={
+                "left_tactile_image": self.tactile_history_offsets,
+                "right_tactile_image": self.tactile_history_offsets,
+            },
+        )
+        return dataclasses.replace(
+            data_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=_transforms.Group(inputs=model_inputs),
@@ -883,6 +976,405 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _make_sim_abs_joint_lora_configs(
+    task_name: str,
+    repo_id: str,
+    *,
+    num_train_steps: int = 10_000,
+    fsdp_devices: int = 1,
+    reuse_full_ft_norm_stats: bool = False,
+) -> list[TrainConfig]:
+    vision_name = f"pi05_{task_name}_sim_abs_joint_relative_action_vision_lora"
+    tactile_name = f"pi05_{task_name}_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora"
+    base_model_kwargs = dict(
+        pi05=True,
+        action_horizon=50,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    )
+    weight_loader = weight_loaders.CheckpointWeightLoader(
+        "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+    )
+
+    vision_model = pi0_config.Pi0Config(
+        **base_model_kwargs,
+        image_keys=sim_policy.VISION_IMAGE_KEYS,
+    )
+    tactile_model = pi0_config.Pi0Config(
+        **base_model_kwargs,
+        image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+        separate_tactile_encoder=True,
+        tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+    )
+    vision_assets = AssetsConfig(
+        assets_dir=f"./assets/pi05_{task_name}_sim_abs_joint_relative_action_vision_full_ft"
+        if reuse_full_ft_norm_stats
+        else None
+    )
+    tactile_assets = AssetsConfig(
+        assets_dir=f"./assets/pi05_{task_name}_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft"
+        if reuse_full_ft_norm_stats
+        else None
+    )
+
+    return [
+        TrainConfig(
+            name=vision_name,
+            model=vision_model,
+            data=LeRobotSimVisionDataConfig(
+                repo_id=repo_id,
+                assets=vision_assets,
+                base_config=DataConfig(prompt_from_task=True),
+                state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+                output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+                delta_joint_actions=True,
+            ),
+            batch_size=64,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=5_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            freeze_filter=vision_model.get_freeze_filter(),
+            weight_loader=weight_loader,
+            num_train_steps=num_train_steps,
+            save_interval=5_000,
+            keep_period=5_000,
+            fsdp_devices=fsdp_devices,
+        ),
+        TrainConfig(
+            name=tactile_name,
+            model=tactile_model,
+            data=LeRobotSimVisionTactileDataConfig(
+                repo_id=repo_id,
+                assets=tactile_assets,
+                base_config=DataConfig(prompt_from_task=True),
+                state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+                output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+                delta_joint_actions=True,
+            ),
+            batch_size=64,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=5_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=None,
+            freeze_filter=tactile_model.get_freeze_filter(),
+            weight_loader=weight_loader,
+            num_train_steps=num_train_steps,
+            save_interval=5_000,
+            keep_period=5_000,
+            fsdp_devices=fsdp_devices,
+        ),
+    ]
+
+
+def _make_sim_abs_joint_full_ft_configs(
+    task_name: str,
+    repo_id: str,
+    num_train_steps: int,
+) -> list[TrainConfig]:
+    vision_name = f"pi05_{task_name}_sim_abs_joint_relative_action_vision_full_ft"
+    tactile_name = f"pi05_{task_name}_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft"
+    base_model_kwargs = {
+        "pi05": True,
+        "action_horizon": 50,
+        "discrete_state_input": False,
+        "paligemma_variant": "gemma_2b",
+        "action_expert_variant": "gemma_300m",
+    }
+    weight_loader = weight_loaders.CheckpointWeightLoader(
+        "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+    )
+
+    vision_model = pi0_config.Pi0Config(
+        **base_model_kwargs,
+        image_keys=sim_policy.VISION_IMAGE_KEYS,
+    )
+    tactile_model = pi0_config.Pi0Config(
+        **base_model_kwargs,
+        image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+        separate_tactile_encoder=True,
+        tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+    )
+
+    def make_train_config(
+        name: str,
+        model: pi0_config.Pi0Config,
+        data: DataConfigFactory,
+    ) -> TrainConfig:
+        return TrainConfig(
+            name=name,
+            model=model,
+            data=data,
+            batch_size=64,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=5_000,
+                peak_lr=5e-5,
+                decay_steps=1_000_000,
+                decay_lr=5e-5,
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=0.999,
+            weight_loader=weight_loader,
+            num_train_steps=num_train_steps,
+            save_interval=5_000,
+            keep_period=5_000,
+            fsdp_devices=4,
+        )
+
+    return [
+        make_train_config(
+            vision_name,
+            vision_model,
+            LeRobotSimVisionDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+                output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+                delta_joint_actions=True,
+            ),
+        ),
+        make_train_config(
+            tactile_name,
+            tactile_model,
+            LeRobotSimVisionTactileDataConfig(
+                repo_id=repo_id,
+                base_config=DataConfig(prompt_from_task=True),
+                state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+                output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+                delta_joint_actions=True,
+            ),
+        ),
+    ]
+
+
+def _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+    task_name: str,
+    repo_id: str,
+    norm_stats_config_name: str,
+    *,
+    num_train_steps: int = 10_000,
+    random_init: bool = False,
+    fsdp_devices: int | None = None,
+    config_task_name: str | None = None,
+) -> TrainConfig:
+    config_task_name = config_task_name or task_name
+    name_suffix = "anytouch2_random_torch_full_ft" if random_init else "anytouch2_torch_full_ft"
+    if fsdp_devices is None:
+        fsdp_devices = 4 if random_init else 1
+    return TrainConfig(
+        name=f"pi05_{config_task_name}_sim_abs_joint_relative_action_vision_tactile_{name_suffix}",
+        project_name="openpi-anytouch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            tactile_encoder_type="anytouch2",
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+            anytouch_checkpoint_path=None
+            if random_init
+            else "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/anytouch2/checkpoint-4frames.pth",
+            anytouch_random_init=random_init,
+            anytouch_num_frames=4,
+            anytouch_stride=2,
+            anytouch_sensor_id=0,
+            anytouch_trainable=True,
+            anytouch_projector_trainable=True,
+            anytouch_keep_cls_sensor_tokens=True,
+            anytouch_patch_tokens_per_side=30,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotSimVisionTactileHistoryDataConfig(
+            repo_id=repo_id,
+            assets=AssetsConfig(assets_dir=f"./assets/{norm_stats_config_name}"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=num_train_steps,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=fsdp_devices,
+        checkpoint_base_dir="./checkpoints/random_anytouch" if random_init else "./checkpoints",
+    )
+
+
+def _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+    task_name: str,
+    repo_id: str,
+    norm_stats_config_name: str,
+    *,
+    num_train_steps: int = 10_000,
+    config_task_name: str | None = None,
+) -> TrainConfig:
+    config_task_name = config_task_name or task_name
+    return TrainConfig(
+        name=(
+            f"pi05_{config_task_name}_sim_abs_joint_relative_action_vision_tactile_"
+            "anytouch2_tactile_expert_torch_full_ft"
+        ),
+        project_name="openpi-anytouch-trex",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            tactile_encoder_type="anytouch2",
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+            anytouch_checkpoint_path=(
+                "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/anytouch2/checkpoint-4frames.pth"
+            ),
+            anytouch_num_frames=4,
+            anytouch_stride=2,
+            anytouch_sensor_id=0,
+            anytouch_trainable=True,
+            anytouch_projector_trainable=True,
+            anytouch_keep_cls_sensor_tokens=True,
+            anytouch_patch_tokens_per_side=30,
+            use_tactile_expert=True,
+            tactile_expert_variant="gemma_300m",
+            flow_num_steps=10,
+            action_expert_steps=6,
+            tactile_loss_weight=1.0,
+            tactile_expert_init="copy_action",
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotSimVisionTactileHistoryDataConfig(
+            repo_id=repo_id,
+            assets=AssetsConfig(assets_dir=f"./assets/{norm_stats_config_name}"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=num_train_steps,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+        policy_metadata={
+            "tactile_architecture": "anytouch2_cascaded_expert",
+            "tactile_clip_offsets": [-6, -4, -2, 0],
+            "flow_num_steps": 10,
+            "action_expert_steps": 6,
+            "tactile_expert_steps": 4,
+            "flow_dispatch": "6+4",
+        },
+    )
+
+
+def _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+    task_name: str,
+    repo_id: str,
+    *,
+    num_train_steps: int = 10_000,
+    config_task_name: str | None = None,
+) -> TrainConfig:
+    """Create the AnyTouch2 Action-Expert conditioning experiment config.
+
+    Unlike the original AnyTouch2 configs, tactile tokens are deliberately kept
+    out of the PaliGemma prefix and are prepended to the action tokens at every
+    flow-matching step.  The data format is the existing single-frame
+    LeRobot format; ``LeRobotSimVisionTactileHistoryDataConfig`` supplies the
+    four-frame ``[t-6,t-4,t-2,t]`` clip lazily.
+    """
+    config_task_name = config_task_name or task_name
+    config_name = (
+        f"pi05_{config_task_name}_sim_abs_joint_relative_action_vision_tactile_"
+        "anytouch2_action_expert_torch_full_ft"
+    )
+    return TrainConfig(
+        name=config_name,
+        project_name="openpi-anytouch-action-expert",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            tactile_encoder_type="anytouch2",
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+            anytouch_token_location="action_expert",
+            anytouch_checkpoint_path=(
+                "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/anytouch2/checkpoint-4frames.pth"
+            ),
+            anytouch_random_init=False,
+            anytouch_num_frames=4,
+            anytouch_stride=2,
+            anytouch_sensor_id=0,
+            anytouch_trainable=True,
+            anytouch_projector_trainable=True,
+            anytouch_keep_cls_sensor_tokens=True,
+            anytouch_patch_tokens_per_side=30,
+            flow_num_steps=10,
+            pytorch_compile_mode=None,
+        ),
+        data=LeRobotSimVisionTactileHistoryDataConfig(
+            repo_id=repo_id,
+            # Keep stats task-local.  Launchers may populate this file by
+            # copying an equivalent existing state/action stats file.
+            assets=AssetsConfig(assets_dir=f"./assets/{config_name}"),
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        pytorch_weight_path="/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Full fine-tuning: the default Nothing filter freezes nothing.
+        ema_decay=None,
+        num_train_steps=num_train_steps,
+        save_interval=5_000,
+        keep_period=5_000,
+        fsdp_devices=4,
+        checkpoint_base_dir="./checkpoints/anytouch_action_expert",
+        policy_metadata={
+            "tactile_architecture": "anytouch2_action_expert",
+            "tactile_token_location": "action_expert",
+            "tactile_tokens": 72,
+            "tactile_clip_offsets": [-6, -4, -2, 0],
+            "flow_num_steps": 10,
+        },
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1918,6 +2410,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+        project_name="openpi-anytouch",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=50,
@@ -1925,22 +2418,24 @@ _CONFIGS = [
             image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
             tactile_encoder_type="anytouch2",
             tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
-            anytouch_checkpoint_path="/shareNFS_40/wyf/workplace/AnyTouch2/checkpoints/anytouch2.pth",
+            anytouch_checkpoint_path="/home/tione/notebook/data/openpi/openpi-assets/checkpoints/anytouch2/checkpoint-4frames.pth",
             anytouch_num_frames=4,
             anytouch_stride=2,
             anytouch_sensor_id=0,
             anytouch_trainable=True,
+            anytouch_projector_trainable=True,
             anytouch_keep_cls_sensor_tokens=True,
             anytouch_patch_tokens_per_side=30,
+            pytorch_compile_mode=None,
         ),
-        data=LeRobotSimVisionTactileClipDataConfig(
-            repo_id="simulation/insert_usb_v3_gelsight_abs_joint_anytouch2_clip",
+        data=LeRobotSimVisionTactileHistoryDataConfig(
+            repo_id="simulation/insert_usb_v3_gelsight_abs_joint",
             base_config=DataConfig(prompt_from_task=True),
             state_dim=sim_policy.ABS_JOINT_STATE_DIM,
             output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
             delta_joint_actions=True,
         ),
-        pytorch_weight_path="/shareNFS_40/wyf/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        pytorch_weight_path="/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
@@ -2065,6 +2560,470 @@ _CONFIGS = [
         num_train_steps=10_000,
         save_interval=5_000,
         keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_pull_drawer_sim_abs_joint_relative_action_vision_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_IMAGE_KEYS,
+        ),
+        data=LeRobotSimVisionDataConfig(
+            repo_id="simulation/pull_drawer_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.VISION_IMAGE_KEYS,
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            separate_tactile_encoder=True,
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+        ),
+        data=LeRobotSimVisionTactileDataConfig(
+            repo_id="simulation/pull_drawer_gelsight_abs_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=sim_policy.ABS_JOINT_STATE_DIM,
+            output_action_dim=sim_policy.ABS_JOINT_ACTION_DIM,
+            delta_joint_actions=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            image_keys=sim_policy.TACTILE_FIRST_VISION_TACTILE_IMAGE_KEYS,
+            separate_tactile_encoder=True,
+            tactile_image_keys=("left_tactile_0_rgb", "right_tactile_0_rgb"),
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/tione/notebook/data/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "pour_ball_to_cup",
+        "simulation/pour_ball_to_cup_gelsight_abs_joint",
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "roughness_regrasp",
+        "simulation/roughness_regrasp_gelsight_abs_joint",
+        fsdp_devices=2,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "turn_gear_pair",
+        "simulation/turn_gear_pair_gelsight_abs_joint",
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "insert_block_v1",
+        "simulation/insert_block_v1_gelsight_abs_joint",
+        10_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        20_000,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "insert_block_v1",
+        "simulation/insert_block_v1_gelsight_abs_joint",
+        fsdp_devices=2,
+        reuse_full_ft_norm_stats=True,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        num_train_steps=20_000,
+        fsdp_devices=2,
+        reuse_full_ft_norm_stats=True,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "grasp_in_clutter",
+        "simulation/grasp_in_clutter_gelsight_abs_joint",
+        fsdp_devices=2,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "move_cup",
+        "simulation/move_cup_gelsight_abs_joint",
+        fsdp_devices=2,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "hardness_classify",
+        "simulation/hardness_classify_gelsight_abs_joint",
+        fsdp_devices=2,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "insert_block_v1",
+        "simulation/insert_block_v1_gelsight_abs_joint",
+        "pi05_insert_block_v1_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        "pi05_insert_block_v2_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "hardness_classify",
+        "simulation/hardness_classify_gelsight_abs_joint",
+        "pi05_hardness_classify_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "pull_drawer",
+        "simulation/pull_drawer_gelsight_abs_joint",
+        "pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "turn_gear_pair",
+        "simulation/turn_gear_pair_gelsight_abs_joint",
+        "pi05_turn_gear_pair_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "weight_classify",
+        "simulation/weight_classify_gelsight_abs_joint",
+        "pi05_weight_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "roughness_regrasp",
+        "simulation/roughness_regrasp_gelsight_abs_joint",
+        "pi05_roughness_regrasp_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "roughness_classify",
+        "simulation/roughness_classify_gelsight_abs_joint",
+        "pi05_roughness_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "weight_classify",
+        "simulation/weight_classify_gelsight_abs_joint",
+        "pi05_weight_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "hardness_classify",
+        "simulation/hardness_classify_gelsight_abs_joint",
+        "pi05_hardness_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "roughness_classify",
+        "simulation/roughness_classify_gelsight_abs_joint",
+        "pi05_roughness_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "roughness_regrasp",
+        "simulation/roughness_regrasp_gelsight_abs_joint",
+        "pi05_roughness_regrasp_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "insert_usb_v3",
+        "simulation/insert_usb_v3_gelsight_abs_joint",
+        "pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+        config_task_name="insert_usb_v3_gelsight",
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "insert_block_v1",
+        "simulation/insert_block_v1_gelsight_abs_joint",
+        "pi05_insert_block_v1_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "pull_drawer",
+        "simulation/pull_drawer_gelsight_abs_joint",
+        "pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "turn_gear_pair",
+        "simulation/turn_gear_pair_gelsight_abs_joint",
+        "pi05_turn_gear_pair_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        "pi05_insert_block_v2_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft",
+        num_train_steps=20_000,
+        random_init=True,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "insert_usb_v3",
+        "simulation/insert_usb_v3_gelsight_abs_joint",
+        "pi05_insert_usb_v3_gelsight_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+        config_task_name="insert_usb_v3_gelsight",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "insert_block_v1",
+        "simulation/insert_block_v1_gelsight_abs_joint",
+        "pi05_insert_block_v1_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        "pi05_insert_block_v2_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "hardness_classify",
+        "simulation/hardness_classify_gelsight_abs_joint",
+        "pi05_hardness_classify_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "pull_drawer",
+        "simulation/pull_drawer_gelsight_abs_joint",
+        "pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "turn_gear_pair",
+        "simulation/turn_gear_pair_gelsight_abs_joint",
+        "pi05_turn_gear_pair_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "weight_classify",
+        "simulation/weight_classify_gelsight_abs_joint",
+        "pi05_weight_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "roughness_regrasp",
+        "simulation/roughness_regrasp_gelsight_abs_joint",
+        "pi05_roughness_regrasp_sim_abs_joint_relative_action_vision_tactile_dual_siglip_lora",
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "roughness_classify",
+        "simulation/roughness_classify_gelsight_abs_joint",
+        "pi05_roughness_classify_sim_abs_joint_relative_action_vision_tactile_anytouch2_torch_full_ft",
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "weight_classify", "simulation/weight_classify_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "hardness_classify", "simulation/hardness_classify_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "roughness_classify", "simulation/roughness_classify_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "roughness_regrasp", "simulation/roughness_regrasp_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "insert_usb_v3",
+        "simulation/insert_usb_v3_gelsight_abs_joint",
+        config_task_name="insert_usb_v3_gelsight",
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "insert_block_v1", "simulation/insert_block_v1_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "pull_drawer", "simulation/pull_drawer_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "turn_gear_pair", "simulation/turn_gear_pair_gelsight_abs_joint"
+    ),
+    _make_sim_abs_joint_anytouch2_action_expert_torch_full_ft_config(
+        "insert_block_v2",
+        "simulation/insert_block_v2_gelsight_abs_joint",
+        num_train_steps=20_000,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "can_empty_select",
+        "simulation/can_empty_select_gelsight_abs_joint",
+        fsdp_devices=4,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "can_empty_select",
+        "simulation/can_empty_select_gelsight_abs_joint",
+        20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select",
+        "simulation/can_empty_select_gelsight_abs_joint",
+        "pi05_can_empty_select_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=20_000,
+    ),
+    *_make_sim_abs_joint_lora_configs(
+        "can_empty_select_v2",
+        "simulation/can_empty_select_v2_gelsight_abs_joint",
+        fsdp_devices=4,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "can_empty_select_v2",
+        "simulation/can_empty_select_v2_gelsight_abs_joint",
+        20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select_v2",
+        "simulation/can_empty_select_v2_gelsight_abs_joint",
+        "pi05_can_empty_select_v2_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=20_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "turn_gear_pair_3cm",
+        "simulation/turn_gear_pair_3cm_gelsight_abs_joint",
+        10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "turn_gear_pair_3cm",
+        "simulation/turn_gear_pair_3cm_gelsight_abs_joint",
+        "pi05_turn_gear_pair_3cm_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "turn_gear_pair_3cm",
+        "simulation/turn_gear_pair_3cm_gelsight_abs_joint",
+        "pi05_turn_gear_pair_3cm_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "turn_gear_pair_3cm",
+        "simulation/turn_gear_pair_3cm_gelsight_abs_joint",
+        "pi05_turn_gear_pair_3cm_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        random_init=True,
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "can_empty_select_v2",
+        "simulation/can_empty_select_v2_gelsight_abs_joint",
+        "pi05_can_empty_select_v2_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select_v2",
+        "simulation/can_empty_select_v2_gelsight_abs_joint",
+        "pi05_can_empty_select_v2_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        random_init=True,
+        num_train_steps=20_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "can_empty_select_v3",
+        "simulation/can_empty_select_v3_gelsight_abs_joint",
+        10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select_v3",
+        "simulation/can_empty_select_v3_gelsight_abs_joint",
+        "pi05_can_empty_select_v3_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "can_empty_select_v3",
+        "simulation/can_empty_select_v3_gelsight_abs_joint",
+        "pi05_can_empty_select_v3_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select_v3",
+        "simulation/can_empty_select_v3_gelsight_abs_joint",
+        "pi05_can_empty_select_v3_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        random_init=True,
+        num_train_steps=10_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "pick_and_place_chips",
+        "simulation/pick_and_place_chips_gelsight_abs_joint",
+        10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "pick_and_place_chips",
+        "simulation/pick_and_place_chips_gelsight_abs_joint",
+        "pi05_pick_and_place_chips_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=10_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "pick_and_place_chips",
+        "simulation/pick_and_place_chips_gelsight_abs_joint",
+        "pi05_pick_and_place_chips_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=10_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "rotate_bulb",
+        "simulation/rotate_bulb_gelsight_abs_joint",
+        20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "rotate_bulb",
+        "simulation/rotate_bulb_gelsight_abs_joint",
+        "pi05_rotate_bulb_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=20_000,
+    ),
+    *_make_sim_abs_joint_full_ft_configs(
+        "strength_wipe",
+        "simulation/strength_wipe_gelsight_abs_joint",
+        20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "strength_wipe",
+        "simulation/strength_wipe_gelsight_abs_joint",
+        "pi05_strength_wipe_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        fsdp_devices=4,
+        num_train_steps=20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_tactile_expert_torch_full_ft_config(
+        "can_empty_select",
+        "simulation/can_empty_select_gelsight_abs_joint",
+        "pi05_can_empty_select_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        num_train_steps=20_000,
+    ),
+    _make_sim_abs_joint_anytouch2_torch_full_ft_config(
+        "can_empty_select",
+        "simulation/can_empty_select_gelsight_abs_joint",
+        "pi05_can_empty_select_sim_abs_joint_relative_action_vision_tactile_dual_siglip_full_ft",
+        random_init=True,
+        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi05_insert_usb_gelsight_sim_delta_eef_vision_lora",

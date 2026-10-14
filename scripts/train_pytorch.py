@@ -31,6 +31,8 @@ import platform
 import shutil
 import time
 
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import numpy as np
 import safetensors.torch
@@ -355,6 +357,10 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
+    if config.batch_size % world_size != 0:
+        raise ValueError(
+            f"Global batch size {config.batch_size} must be divisible by DDP world size {world_size}."
+        )
     effective_batch_size = config.batch_size // world_size
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
@@ -465,7 +471,7 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
+    if config.pytorch_weight_path is not None and not resuming:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
@@ -489,14 +495,34 @@ def train_loop(config: _config.TrainConfig):
                 len(tactile_missing),
             )
         elif model_cfg.tactile_encoder_type == "anytouch2":
-            anytouch_missing = [name for name in missing if "anytouch2_encoder" in name]
-            non_anytouch_missing = [name for name in missing if "anytouch2_encoder" not in name]
+            allowed_missing_prefixes = ["anytouch2_encoder"]
+            if model_cfg.use_tactile_expert:
+                allowed_missing_prefixes.extend(
+                    ["paligemma_with_expert.gemma_tactile_expert", "tactile_action_out_proj"]
+                )
+            anytouch_missing = [
+                name for name in missing if any(prefix in name for prefix in allowed_missing_prefixes)
+            ]
+            non_anytouch_missing = [
+                name for name in missing if not any(prefix in name for prefix in allowed_missing_prefixes)
+            ]
             if non_anytouch_missing or unexpected:
                 raise RuntimeError(
                     "Unexpected PyTorch checkpoint mismatch while loading AnyTouch2 model: "
                     f"non_anytouch_missing={non_anytouch_missing[:20]}, unexpected={unexpected[:20]}"
                 )
-            logging.info("Loaded base weights; AnyTouch2 tensors come from its checkpoint. missing=%d", len(anytouch_missing))
+            if model_cfg.use_tactile_expert:
+                model_to_load.init_tactile_expert_from_action_expert()
+                logging.info(
+                    "Initialized Tactile Expert and output head from the loaded Action Expert; missing=%d",
+                    len(anytouch_missing),
+                )
+            else:
+                logging.info(
+                    "Loaded base weights; AnyTouch2 tensors are %s. missing=%d",
+                    "randomly initialized" if model_cfg.anytouch_random_init else "loaded from its checkpoint",
+                    len(anytouch_missing),
+                )
         elif model_cfg.tactile_encoder_type == "sparsh_dinov2":
             sparsh_missing = [name for name in missing if "sparsh_encoder" in name]
             non_sparsh_missing = [name for name in missing if "sparsh_encoder" not in name]
@@ -518,8 +544,12 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("No trainable parameters found after applying model freeze settings.")
+    logging.info("Trainable parameters: %d", sum(parameter.numel() for parameter in trainable_parameters))
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -590,13 +620,23 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-            loss = losses.mean()
+            loss_metrics = {}
+            if isinstance(losses, dict):
+                action_loss = losses["action_loss"].mean()
+                tactile_loss = losses["tactile_loss"].mean()
+                loss = action_loss + model_cfg.tactile_loss_weight * tactile_loss
+                loss_metrics = {
+                    "action_loss": action_loss.detach().item(),
+                    "tactile_loss": tactile_loss.detach().item(),
+                    "action_velocity_abs_mean": losses["action_velocity_abs_mean"].detach().item(),
+                    "tactile_velocity_abs_mean": losses["tactile_velocity_abs_mean"].detach().item(),
+                }
+            else:
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
 
             # Backward pass
             loss.backward()
@@ -625,6 +665,7 @@ def train_loop(config: _config.TrainConfig):
                         "loss": loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        **loss_metrics,
                     }
                 )
 
@@ -634,6 +675,16 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                averaged_model_metrics = {
+                    key: sum(info[key] for info in infos) / len(infos)
+                    for key in (
+                        "action_loss",
+                        "tactile_loss",
+                        "action_velocity_abs_mean",
+                        "tactile_velocity_abs_mean",
+                    )
+                    if all(key in info for info in infos)
+                }
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -658,6 +709,7 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    log_payload.update(averaged_model_metrics)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

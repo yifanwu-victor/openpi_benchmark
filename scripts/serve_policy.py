@@ -7,6 +7,19 @@ import socket
 # Serve usually benefits from allocating GPU memory on demand instead of
 # preallocating most of the visible device at startup.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_triton_ptxas_dir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".venv",
+    "lib",
+    "python3.11",
+    "site-packages",
+    "triton",
+    "backends",
+    "nvidia",
+    "bin",
+)
+if os.path.isfile(os.path.join(_triton_ptxas_dir, "ptxas")):
+    os.environ["PATH"] = f"{_triton_ptxas_dir}:{os.environ.get('PATH', '')}"
 
 import tyro
 

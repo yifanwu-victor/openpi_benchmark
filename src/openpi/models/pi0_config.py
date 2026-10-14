@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -29,13 +29,22 @@ class Pi0Config(_model.BaseModelConfig):
     separate_tactile_encoder: bool = False
     tactile_image_keys: tuple[str, ...] = ("left_tactile_0_rgb", "right_tactile_0_rgb")
     tactile_encoder_type: str = "siglip"
+    anytouch_token_location: Literal["vlm_prefix", "action_expert"] = "vlm_prefix"
     anytouch_checkpoint_path: str | None = None
+    anytouch_random_init: bool = False
     anytouch_num_frames: int = 4
     anytouch_stride: int = 2
     anytouch_sensor_id: int = 0
     anytouch_trainable: bool = True
+    anytouch_projector_trainable: bool = True
     anytouch_keep_cls_sensor_tokens: bool = True
     anytouch_patch_tokens_per_side: int = 30
+    use_tactile_expert: bool = False
+    tactile_expert_variant: _gemma.Variant = "gemma_300m"
+    flow_num_steps: int = 10
+    action_expert_steps: int = 6
+    tactile_loss_weight: float = 1.0
+    tactile_expert_init: str = "copy_action"
     sparsh_model_name_or_path: str = "facebook/sparsh-dinov2-base"
     sparsh_in_chans: int = 6
     sparsh_frame_offsets: tuple[int, int] = (-5, 0)
@@ -65,6 +74,38 @@ class Pi0Config(_model.BaseModelConfig):
             ]
         if self.tactile_encoder_type not in ("siglip", "anytouch2", "sparsh_dinov2"):
             raise ValueError(f"Unsupported tactile_encoder_type: {self.tactile_encoder_type}")
+        if self.anytouch_token_location not in ("vlm_prefix", "action_expert"):
+            raise ValueError(
+                "anytouch_token_location must be 'vlm_prefix' or 'action_expert', "
+                f"got {self.anytouch_token_location!r}."
+            )
+        if self.anytouch_token_location == "action_expert" and self.tactile_encoder_type != "anytouch2":
+            raise ValueError("anytouch_token_location='action_expert' requires tactile_encoder_type='anytouch2'.")
+        if self.anytouch_random_init and self.tactile_encoder_type != "anytouch2":
+            raise ValueError("anytouch_random_init requires tactile_encoder_type='anytouch2'.")
+        if self.anytouch_random_init and self.anytouch_checkpoint_path is not None:
+            raise ValueError("anytouch_random_init cannot be combined with anytouch_checkpoint_path.")
+        if self.flow_num_steps < 1:
+            raise ValueError(f"flow_num_steps must be positive, got {self.flow_num_steps}")
+        if self.use_tactile_expert:
+            if not self.pi05:
+                raise ValueError("Tactile Expert is supported only for Pi05.")
+            if self.tactile_encoder_type != "anytouch2":
+                raise ValueError("Tactile Expert requires tactile_encoder_type='anytouch2'.")
+            if not 0 < self.action_expert_steps < self.flow_num_steps:
+                raise ValueError(
+                    "action_expert_steps must be between zero and flow_num_steps, got "
+                    f"{self.action_expert_steps}/{self.flow_num_steps}"
+                )
+            if self.tactile_loss_weight < 0:
+                raise ValueError(f"tactile_loss_weight must be non-negative, got {self.tactile_loss_weight}")
+            if self.tactile_expert_init != "copy_action":
+                raise ValueError(f"Unsupported tactile_expert_init: {self.tactile_expert_init}")
+            if self.tactile_expert_variant != self.action_expert_variant:
+                raise ValueError(
+                    "copy_action requires matching action/tactile expert variants, got "
+                    f"{self.action_expert_variant}/{self.tactile_expert_variant}"
+                )
 
     @property
     @override

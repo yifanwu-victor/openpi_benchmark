@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.separate_tactile_encoder = config.separate_tactile_encoder
+        self.tactile_image_keys = frozenset(config.tactile_image_keys)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         self.image_keys = config.image_keys
@@ -89,7 +91,11 @@ class Pi0(_model.BaseModel):
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        if self.separate_tactile_encoder:
+            tactile_img = nnx.clone(img)
+            self.PaliGemma = nnx.Dict(llm=llm, img=img, tactile_img=tactile_img)
+        else:
+            self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -111,8 +117,9 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         # embed images
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+        for name in self.image_keys:
+            image_encoder = self.PaliGemma.tactile_img if name in self.tactile_image_keys else self.PaliGemma.img
+            image_tokens, _ = image_encoder(obs.images[name], train=False)
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -136,6 +143,14 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def initialize_tactile_encoder_from_vision(self) -> None:
+        """Initialize the separate tactile SigLIP from the loaded visual SigLIP."""
+        if not self.separate_tactile_encoder:
+            return
+
+        visual_state = nnx.state(self.PaliGemma.img)
+        nnx.update(self.PaliGemma.tactile_img, visual_state)
 
     @at.typecheck
     def embed_suffix(

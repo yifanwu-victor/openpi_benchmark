@@ -48,6 +48,7 @@ class WebsocketPolicyServer:
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
+        policy = self._policy.create_session() if hasattr(self._policy, "create_session") else self._policy
 
         await websocket.send(packer.pack(self._metadata))
 
@@ -58,7 +59,7 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

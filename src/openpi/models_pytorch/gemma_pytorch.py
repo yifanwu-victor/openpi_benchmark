@@ -14,9 +14,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         self,
         vlm_config,
         action_expert_config,
+        *,
+        tactile_expert_config=None,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
         separate_tactile_encoder: bool = False,
+        use_tactile_expert: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -41,19 +44,22 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
-        action_expert_config_hf = CONFIG_MAPPING["gemma"](
-            head_dim=action_expert_config.head_dim,
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
-            torch_dtype="float32",
-            use_adarms=use_adarms[1],
-            adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
-        )
+        def make_expert_config(expert_config):
+            return CONFIG_MAPPING["gemma"](
+                head_dim=expert_config.head_dim,
+                hidden_size=expert_config.width,
+                intermediate_size=expert_config.mlp_dim,
+                num_attention_heads=expert_config.num_heads,
+                num_hidden_layers=expert_config.depth,
+                num_key_value_heads=expert_config.num_kv_heads,
+                vocab_size=257152,
+                hidden_activation="gelu_pytorch_tanh",
+                torch_dtype="float32",
+                use_adarms=use_adarms[1],
+                adarms_cond_dim=expert_config.width if use_adarms[1] else None,
+            )
+
+        action_expert_config_hf = make_expert_config(action_expert_config)
 
         self.separate_tactile_encoder = separate_tactile_encoder
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
@@ -62,6 +68,12 @@ class PaliGemmaWithExpertModel(nn.Module):
             self.tactile_multi_modal_projector = copy.deepcopy(self.paligemma.model.multi_modal_projector)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        self.use_tactile_expert = use_tactile_expert
+        if self.use_tactile_expert:
+            tactile_expert_config = tactile_expert_config or action_expert_config
+            tactile_expert_config_hf = make_expert_config(tactile_expert_config)
+            self.gemma_tactile_expert = GemmaForCausalLM(config=tactile_expert_config_hf)
+            self.gemma_tactile_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -96,6 +108,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.tactile_vision_tower.load_state_dict(self.paligemma.model.vision_tower.state_dict())
         self.tactile_multi_modal_projector.load_state_dict(self.paligemma.model.multi_modal_projector.state_dict())
 
+    def init_tactile_expert_from_action_expert(self):
+        if not self.use_tactile_expert:
+            return
+        self.gemma_tactile_expert.load_state_dict(self.gemma_expert.state_dict(), strict=True)
+
     def embed_tactile_image(self, image: torch.Tensor):
         if not self.separate_tactile_encoder:
             return self.embed_image(image)
@@ -114,6 +131,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        expert: Literal["action", "tactile"] = "action",
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -130,7 +148,10 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
+            if expert == "tactile" and not self.use_tactile_expert:
+                raise ValueError("Tactile Expert forward requested but the model does not have one.")
+            expert_model = self.gemma_tactile_expert if expert == "tactile" else self.gemma_expert
+            suffix_result = expert_model.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -138,10 +159,12 @@ class PaliGemmaWithExpertModel(nn.Module):
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
             )
-            suffix_output = suffix_output.last_hidden_state
+            suffix_output = suffix_result.last_hidden_state
             prefix_output = None
-            prefix_past_key_values = None
+            prefix_past_key_values = suffix_result.past_key_values
         else:
+            if expert != "action":
+                raise ValueError("Joint PaliGemma/expert forward is supported only for the Action Expert.")
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 

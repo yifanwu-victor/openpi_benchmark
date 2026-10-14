@@ -132,6 +132,7 @@ class SimVisionTactileInputs(transforms.DataTransformFn):
 
     model_type: _model.ModelType
     state_dim: int | None = None
+    image_keys: tuple[str, ...] = VISION_TACTILE_IMAGE_KEYS
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -139,11 +140,23 @@ class SimVisionTactileInputs(transforms.DataTransformFn):
         left_tactile_image = _parse_image(data["observation/left_tactile_image"])
         right_tactile_image = _parse_image(data["observation/right_tactile_image"])
 
+        available_images = {
+            "base_0_rgb": base_image,
+            "wrist_0_rgb": wrist_image,
+            "left_tactile_0_rgb": left_tactile_image,
+            "right_tactile_0_rgb": right_tactile_image,
+        }
+        if set(self.image_keys) != set(available_images):
+            raise ValueError(
+                "SimVisionTactileInputs.image_keys must contain exactly the four sim visual/tactile keys, "
+                f"got {self.image_keys}"
+            )
+
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
-                names = VISION_TACTILE_IMAGE_KEYS
-                images = (base_image, wrist_image, left_tactile_image, right_tactile_image)
-                image_masks = (np.True_, np.True_, np.True_, np.True_)
+                names = self.image_keys
+                images = tuple(available_images[name] for name in names)
+                image_masks = (np.True_,) * len(names)
             case _:
                 raise ValueError(f"Unsupported model type for sim vision+tactile policy: {self.model_type}")
 

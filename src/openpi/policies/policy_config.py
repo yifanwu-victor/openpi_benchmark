@@ -3,6 +3,8 @@ import os
 import pathlib
 from typing import Any
 
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax.numpy as jnp
 
 import openpi.models.model as _model
@@ -80,7 +82,7 @@ def create_trained_policy(
 
     default_prompt_transforms = [] if data_config.prompt_required else [transforms.InjectDefaultPrompt(default_prompt)]
 
-    return _policy.Policy(
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -100,3 +102,9 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    if is_pytorch and getattr(train_config.model, "tactile_encoder_type", None) == "anytouch2":
+        return _policy.TactileClipPolicy(
+            policy,
+            num_frames=train_config.model.anytouch_num_frames,
+        )
+    return policy

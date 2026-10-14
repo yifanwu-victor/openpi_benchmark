@@ -7,10 +7,10 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.models_pytorch.anytouch2 import AnyTouch2TactileEncoder
-from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
+from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.sparsh import SparshDINOv2TactileEncoder
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -91,26 +91,42 @@ class PI0Pytorch(nn.Module):
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        tactile_expert_config = _gemma.get_config(config.tactile_expert_variant)
+        if config.use_tactile_expert and tactile_expert_config.width != action_expert_config.width:
+            raise ValueError(
+                "Tactile Expert and Action Expert widths must match to share action/time projections, got "
+                f"{tactile_expert_config.width} and {action_expert_config.width}."
+            )
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
+            tactile_expert_config=tactile_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
             separate_tactile_encoder=config.separate_tactile_encoder,
+            use_tactile_expert=config.use_tactile_expert,
         )
         self.tactile_image_keys = set(config.tactile_image_keys)
         self.tactile_encoder_type = config.tactile_encoder_type
         if self.tactile_encoder_type == "anytouch2":
             self.anytouch2_encoder = AnyTouch2TactileEncoder(
                 checkpoint_path=config.anytouch_checkpoint_path,
+                random_init=config.anytouch_random_init,
                 num_frames=config.anytouch_num_frames,
                 stride=config.anytouch_stride,
                 sensor_id=config.anytouch_sensor_id,
                 trainable=config.anytouch_trainable,
+                projector_trainable=config.anytouch_projector_trainable,
                 keep_cls_sensor_tokens=config.anytouch_keep_cls_sensor_tokens,
                 patch_tokens_per_side=config.anytouch_patch_tokens_per_side,
-                output_dim=paligemma_config.width,
+                output_dim=(
+                    action_expert_config.width
+                    if config.anytouch_token_location == "action_expert"
+                    else tactile_expert_config.width
+                    if config.use_tactile_expert
+                    else paligemma_config.width
+                ),
                 dtype=getattr(torch, config.dtype),
             )
         else:
@@ -129,6 +145,8 @@ class PI0Pytorch(nn.Module):
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
+        if config.use_tactile_expert:
+            self.tactile_action_out_proj = nn.Linear(tactile_expert_config.width, config.action_dim)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -154,6 +172,12 @@ class PI0Pytorch(nn.Module):
         except ImportError:
             raise ValueError(msg) from None
 
+    def init_tactile_expert_from_action_expert(self):
+        if not self.config.use_tactile_expert:
+            return
+        self.paligemma_with_expert.init_tactile_expert_from_action_expert()
+        self.tactile_action_out_proj.load_state_dict(self.action_out_proj.state_dict(), strict=True)
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -166,6 +190,8 @@ class PI0Pytorch(nn.Module):
         if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_enable"):
             self.sparsh_encoder.encoder.gradient_checkpointing_enable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        if self.config.use_tactile_expert:
+            self.paligemma_with_expert.gemma_tactile_expert.model.gradient_checkpointing = True
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
@@ -181,6 +207,8 @@ class PI0Pytorch(nn.Module):
         if self.sparsh_encoder is not None and hasattr(self.sparsh_encoder.encoder, "gradient_checkpointing_disable"):
             self.sparsh_encoder.encoder.gradient_checkpointing_disable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        if self.config.use_tactile_expert:
+            self.paligemma_with_expert.gemma_tactile_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
@@ -207,7 +235,7 @@ class PI0Pytorch(nn.Module):
             observation, train=train, image_keys=self.config.image_keys
         )
         return (
-            list(observation.images.items()),
+            [(key, observation.images[key]) for key in self.config.image_keys],
             observation.image_masks,
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
@@ -228,6 +256,63 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def sample_tactile_time(self, bsize, device):
+        split_time = self.action_tactile_split_time
+        time = split_time * sample_beta(1.5, 1.0, bsize, device)
+        return time.clamp_min(split_time * 0.001).to(dtype=torch.float32, device=device)
+
+    @property
+    def action_tactile_split_time(self) -> float:
+        return 1.0 - self.config.action_expert_steps / self.config.flow_num_steps
+
+    def _split_image_items(self, image_items):
+        routes_tactile_to_expert = self.config.use_tactile_expert or (
+            self.config.anytouch_token_location == "action_expert"
+        )
+        if not routes_tactile_to_expert:
+            return image_items, []
+        vision_items = [(key, image) for key, image in image_items if key not in self.tactile_image_keys]
+        tactile_by_key = {key: image for key, image in image_items if key in self.tactile_image_keys}
+        missing = [key for key in self.config.tactile_image_keys if key not in tactile_by_key]
+        if missing:
+            raise ValueError(f"Tactile Expert input is missing tactile clips: {missing}")
+        tactile_items = [(key, tactile_by_key[key]) for key in self.config.tactile_image_keys]
+        return vision_items, tactile_items
+
+    def embed_tactile_tokens(self, tactile_items) -> torch.Tensor:
+        if not self.config.use_tactile_expert or self.anytouch2_encoder is None:
+            raise ValueError("Tactile token embedding requires an enabled AnyTouch2 Tactile Expert.")
+        tactile_tokens = [self._apply_checkpoint(self.anytouch2_encoder, clip) for _, clip in tactile_items]
+        expected_tokens_per_side = (
+            (6 if self.config.anytouch_keep_cls_sensor_tokens else 0) + self.config.anytouch_patch_tokens_per_side
+        )
+        actual = [tokens.shape[1] for tokens in tactile_tokens]
+        if actual != [expected_tokens_per_side, expected_tokens_per_side]:
+            raise ValueError(
+                f"Expected {expected_tokens_per_side} AnyTouch tokens per side, got {actual}."
+            )
+        return torch.cat(tactile_tokens, dim=1)
+
+    def _embed_action_expert_tactile_tokens(self, tactile_items) -> torch.Tensor:
+        """Encode tactile clips for the Action Expert suffix in fixed left/right order."""
+        if self.config.anytouch_token_location != "action_expert":
+            raise ValueError("Action Expert tactile tokens require anytouch_token_location='action_expert'.")
+        if self.anytouch2_encoder is None:
+            raise ValueError("Action Expert tactile tokens require an AnyTouch2 encoder.")
+        tactile_by_key = {key: image for key, image in tactile_items}
+        missing = [key for key in self.config.tactile_image_keys if key not in tactile_by_key]
+        if missing:
+            raise ValueError(f"Action Expert input is missing tactile clips: {missing}")
+        tokens = [
+            self._apply_checkpoint(self.anytouch2_encoder, tactile_by_key[key])
+            for key in self.config.tactile_image_keys
+        ]
+        expected = (6 if self.config.anytouch_keep_cls_sensor_tokens else 0) + self.config.anytouch_patch_tokens_per_side
+        actual = [token.shape[1] for token in tokens]
+        if actual != [expected, expected]:
+            raise ValueError(f"Expected {expected} AnyTouch tokens per side, got {actual}.")
+        return torch.cat(tokens, dim=1)
+
     def embed_prefix(
         self, image_items, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -238,8 +323,11 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Process images
+        # Process images. In Action-Expert mode tactile clips are routed to the
+        # expert suffix and must never enter the VLM prefix.
         for image_key, img in image_items:
+            if self.config.anytouch_token_location == "action_expert" and image_key in self.tactile_image_keys:
+                continue
             img_mask = img_masks[image_key]
             use_tactile_encoder = image_key in self.tactile_image_keys
 
@@ -287,7 +375,7 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, *, detach_shared=False):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -349,6 +437,11 @@ class PI0Pytorch(nn.Module):
             action_time_emb = action_emb
             adarms_cond = time_emb
 
+        if detach_shared:
+            action_time_emb = action_time_emb.detach()
+            if adarms_cond is not None:
+                adarms_cond = adarms_cond.detach()
+
         # Add to input tokens
         embs.append(action_time_emb)
 
@@ -366,22 +459,35 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
-
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    def _compute_action_velocity(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        state,
+        x_t,
+        time,
+        tactile_tokens=None,
+    ):
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if self.config.anytouch_token_location == "action_expert":
+            if tactile_tokens is None:
+                raise ValueError("Action Expert mode requires tactile tokens for every denoising step.")
+            tactile_tokens = tactile_tokens.to(dtype=suffix_embs.dtype)
+            tactile_pad_masks = torch.ones(
+                tactile_tokens.shape[:2], dtype=torch.bool, device=tactile_tokens.device
+            )
+            # ``make_att_2d_masks`` interprets a 1 as a new block and a 0 as
+            # continuation of the current block.  The tactile block is
+            # bidirectional; ``embed_suffix`` supplies the existing action
+            # block mask ([1, 0, ...]), so actions see all tactile tokens while
+            # tactile tokens cannot read the noisy action.
+            tactile_att_masks = torch.zeros(
+                tactile_tokens.shape[:2], dtype=suffix_att_masks.dtype, device=tactile_tokens.device
+            )
+            suffix_embs = torch.cat([tactile_tokens, suffix_embs], dim=1)
+            suffix_pad_masks = torch.cat([tactile_pad_masks, suffix_pad_masks], dim=1)
+            suffix_att_masks = torch.cat([tactile_att_masks, suffix_att_masks], dim=1)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -421,28 +527,13 @@ class PI0Pytorch(nn.Module):
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
-
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    def _build_prefix_cache(self, prefix_embs, prefix_pad_masks, prefix_att_masks):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -450,25 +541,242 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        if past_key_values is None:
+            raise RuntimeError("PaliGemma did not return the requested prefix KV cache.")
+        return past_key_values
+
+    def _refresh_boundary_cache(self, state, prefix_pad_masks, prefix_cache, x_t, timestep):
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size, prefix_len = prefix_pad_masks.shape
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        position_ids = torch.sum(prefix_pad_masks, dim=-1)[:, None] + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        _, boundary_cache = self.paligemma_with_expert.forward(
+            attention_mask=self._prepare_attention_masks_4d(full_att_2d_masks),
+            position_ids=position_ids,
+            past_key_values=prefix_cache,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=True,
+            adarms_cond=[None, adarms_cond],
+            expert="action",
+        )
+        if boundary_cache is None:
+            raise RuntimeError("Action Expert did not return the requested boundary KV cache.")
+        return boundary_cache, torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+
+    def _temporarily_disable_cache_incompatible_checkpointing(self):
+        models = [
+            self.paligemma_with_expert.paligemma.language_model,
+            self.paligemma_with_expert.gemma_expert.model,
+        ]
+        previous = [getattr(model, "gradient_checkpointing", False) for model in models]
+        previous_wrapper_state = self.gradient_checkpointing_enabled
+        self.gradient_checkpointing_enabled = False
+        for model in models:
+            model.gradient_checkpointing = False
+
+        class RestoreCheckpointing:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                for model, enabled in zip(models, previous, strict=True):
+                    model.gradient_checkpointing = enabled
+                self_outer.gradient_checkpointing_enabled = previous_wrapper_state
+
+        self_outer = self
+        return RestoreCheckpointing()
+
+    def _action_partial_sample(self, state, prefix_pad_masks, prefix_cache, noise):
+        dt = -1.0 / self.config.flow_num_steps
+        x_t = noise
+        batch_size = noise.shape[0]
+        for step in range(self.config.action_expert_steps):
+            timestep = torch.full(
+                (batch_size,), 1.0 + step * dt, dtype=torch.float32, device=noise.device
+            )
+            x_t = x_t + dt * self.denoise_step(state, prefix_pad_masks, prefix_cache, x_t, timestep)
+        split_time = torch.full(
+            (batch_size,), self.action_tactile_split_time, dtype=torch.float32, device=noise.device
+        )
+        return x_t, self._refresh_boundary_cache(state, prefix_pad_masks, prefix_cache, x_t, split_time)
+
+    def _tactile_denoise_step(
+        self,
+        boundary_pad_masks,
+        boundary_cache,
+        tactile_tokens,
+        state,
+        x_t,
+        timestep,
+        *,
+        detach_shared=False,
+    ):
+        action_embs, action_pad_masks, action_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep, detach_shared=detach_shared
+        )
+        tactile_tokens = tactile_tokens.to(dtype=action_embs.dtype)
+        batch_size, tactile_len = tactile_tokens.shape[:2]
+        tactile_pad_masks = torch.ones(batch_size, tactile_len, dtype=torch.bool, device=x_t.device)
+        tactile_att_masks = torch.zeros(batch_size, tactile_len, dtype=action_att_masks.dtype, device=x_t.device)
+        suffix_embs = torch.cat([tactile_tokens, action_embs], dim=1)
+        suffix_pad_masks = torch.cat([tactile_pad_masks, action_pad_masks], dim=1)
+        suffix_att_masks = torch.cat([tactile_att_masks, action_att_masks], dim=1)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        boundary_len = boundary_pad_masks.shape[1]
+        boundary_att_masks = boundary_pad_masks[:, None, :].expand(batch_size, suffix_len, boundary_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([boundary_att_masks, suffix_att_2d_masks], dim=2)
+        position_ids = (
+            torch.sum(boundary_pad_masks, dim=-1)[:, None] + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        )
+        self.paligemma_with_expert.gemma_tactile_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        def tactile_forward(suffix_embs, attention_mask, position_ids, adarms_cond):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=boundary_cache,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+                expert="tactile",
+            )
+            return outputs_embeds[1]
+
+        tactile_out = self._apply_checkpoint(
+            tactile_forward, suffix_embs, full_att_2d_masks_4d, position_ids, adarms_cond
+        )
+        action_out = tactile_out[:, -self.config.action_horizon :].to(dtype=torch.float32)
+        return self.tactile_action_out_proj(action_out)
+
+    def forward(self, observation, actions, noise=None, time=None) -> Tensor | dict[str, Tensor]:
+        """Do a full training forward pass and compute per-element flow-matching losses."""
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        vision_images, tactile_images = self._split_image_items(images)
+
+        action_noise = noise if noise is not None else self.sample_noise(actions.shape, actions.device)
+        action_time = time if time is not None else self.sample_time(actions.shape[0], actions.device)
+        action_time_expanded = action_time[:, None, None]
+        action_x_t = action_time_expanded * action_noise + (1 - action_time_expanded) * actions
+        action_target = action_noise - actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            vision_images, img_masks, lang_tokens, lang_masks
+        )
+        action_expert_tactile_tokens = (
+            self._embed_action_expert_tactile_tokens(tactile_images)
+            if self.config.anytouch_token_location == "action_expert"
+            else None
+        )
+        action_velocity = self._compute_action_velocity(
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            state,
+            action_x_t,
+            action_time,
+            tactile_tokens=action_expert_tactile_tokens,
+        )
+        action_loss = F.mse_loss(action_target, action_velocity, reduction="none")
+
+        if not self.config.use_tactile_expert:
+            return action_loss
+
+        with torch.no_grad(), self._temporarily_disable_cache_incompatible_checkpointing():
+            prefix_cache = self._build_prefix_cache(
+                prefix_embs.detach(), prefix_pad_masks, prefix_att_masks
+            )
+            boundary_noise = self.sample_noise(actions.shape, actions.device)
+            _, (boundary_cache, boundary_pad_masks) = self._action_partial_sample(
+                state, prefix_pad_masks, prefix_cache, boundary_noise
+            )
+
+        tactile_tokens = self.embed_tactile_tokens(tactile_images)
+        tactile_noise = self.sample_noise(actions.shape, actions.device)
+        tactile_time = self.sample_tactile_time(actions.shape[0], actions.device)
+        tactile_time_expanded = tactile_time[:, None, None]
+        tactile_x_t = tactile_time_expanded * tactile_noise + (1 - tactile_time_expanded) * actions
+        tactile_target = tactile_noise - actions
+        tactile_velocity = self._tactile_denoise_step(
+            boundary_pad_masks,
+            boundary_cache,
+            tactile_tokens,
+            state,
+            tactile_x_t,
+            tactile_time,
+            detach_shared=True,
+        )
+        tactile_loss = F.mse_loss(tactile_target, tactile_velocity, reduction="none")
+
+        return {
+            "action_loss": action_loss,
+            "tactile_loss": tactile_loss,
+            "action_velocity_abs_mean": action_velocity.detach().abs().mean(),
+            "tactile_velocity_abs_mean": tactile_velocity.detach().abs().mean(),
+        }
+
+    @torch.no_grad()
+    def sample_actions(
+        self, device, observation, noise=None, num_steps=None, *, disable_tactile_expert=False
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        vision_images, tactile_images = self._split_image_items(images)
+        num_steps = self.config.flow_num_steps if num_steps is None else num_steps
+        if self.config.use_tactile_expert and not disable_tactile_expert and num_steps != self.config.flow_num_steps:
+            raise ValueError(
+                f"Cascaded sampling requires exactly {self.config.flow_num_steps} steps, got {num_steps}."
+            )
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            vision_images, img_masks, lang_tokens, lang_masks
+        )
+        past_key_values = self._build_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+        action_expert_tactile_tokens = (
+            self._embed_action_expert_tactile_tokens(tactile_images)
+            if self.config.anytouch_token_location == "action_expert"
+            else None
+        )
+
+        if self.config.use_tactile_expert and not disable_tactile_expert:
+            x_t, (boundary_cache, boundary_pad_masks) = self._action_partial_sample(
+                state, prefix_pad_masks, past_key_values, noise
+            )
+            tactile_tokens = self.embed_tactile_tokens(tactile_images)
+            dt = -1.0 / self.config.flow_num_steps
+            for step in range(self.config.action_expert_steps, self.config.flow_num_steps):
+                timestep = torch.full((bsize,), 1.0 + step * dt, dtype=torch.float32, device=device)
+                velocity = self._tactile_denoise_step(
+                    boundary_pad_masks, boundary_cache, tactile_tokens, state, x_t, timestep
+                )
+                x_t = x_t + dt * velocity
+            return x_t
 
         dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
-
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        for step in range(num_steps):
+            expanded_time = torch.full((bsize,), 1.0 + step * dt, dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
                 expanded_time,
+                tactile_tokens=action_expert_tactile_tokens,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            time += dt
         return x_t
 
     def denoise_step(
@@ -478,9 +786,23 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        tactile_tokens=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        if self.config.anytouch_token_location == "action_expert":
+            if tactile_tokens is None:
+                raise ValueError("Action Expert mode requires tactile tokens for every denoising step.")
+            tactile_tokens = tactile_tokens.to(dtype=suffix_embs.dtype)
+            tactile_pad_masks = torch.ones(
+                tactile_tokens.shape[:2], dtype=torch.bool, device=tactile_tokens.device
+            )
+            tactile_att_masks = torch.zeros(
+                tactile_tokens.shape[:2], dtype=suffix_att_masks.dtype, device=tactile_tokens.device
+            )
+            suffix_embs = torch.cat([tactile_tokens, suffix_embs], dim=1)
+            suffix_pad_masks = torch.cat([tactile_pad_masks, suffix_pad_masks], dim=1)
+            suffix_att_masks = torch.cat([tactile_att_masks, suffix_att_masks], dim=1)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

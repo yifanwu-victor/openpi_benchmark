@@ -2,6 +2,8 @@ import dataclasses
 import os
 import pathlib
 
+import jax
+import numpy as np
 import pytest
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -9,6 +11,36 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from openpi.training import config as _config
 
 from . import train
+
+
+class _PartialCheckpointLoader:
+    def load(self, params):
+        del params
+        return {
+            "PaliGemma": {
+                "img": {
+                    "kernel": np.ones((2,), dtype=np.float32),
+                }
+            }
+        }
+
+
+def test_partial_checkpoint_allows_missing_tactile_encoder():
+    params_shape = {
+        "PaliGemma": {
+            "img": {"kernel": jax.ShapeDtypeStruct((2,), np.float32)},
+            "tactile_img": {"kernel": jax.ShapeDtypeStruct((2,), np.float32)},
+        }
+    }
+
+    loaded = train._load_weights_and_validate(  # noqa: SLF001
+        _PartialCheckpointLoader(),
+        params_shape,
+        allow_missing_regex=".*tactile_img.*",
+    )
+
+    np.testing.assert_array_equal(loaded["PaliGemma"]["img"]["kernel"], np.ones((2,), dtype=np.float32))
+    assert "tactile_img" not in loaded["PaliGemma"]
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

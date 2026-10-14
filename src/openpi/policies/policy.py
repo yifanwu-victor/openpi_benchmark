@@ -1,8 +1,11 @@
 from collections.abc import Sequence
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import flax
 import flax.traverse_util
@@ -109,6 +112,80 @@ class Policy(BasePolicy):
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
+    def create_session(self) -> "Policy":
+        return self
+
+
+class TactileClipPolicy(_base_policy.BasePolicy):
+    def __init__(
+        self,
+        policy: BasePolicy,
+        *,
+        num_frames: int = 4,
+        image_size: int = 224,
+        left_image_key: str = "observation/left_tactile_image",
+        right_image_key: str = "observation/right_tactile_image",
+        left_clip_key: str = "observation/left_tactile_clip",
+        right_clip_key: str = "observation/right_tactile_clip",
+    ):
+        if num_frames < 1 or image_size < 1:
+            raise ValueError(f"num_frames and image_size must be positive, got {num_frames}, {image_size}")
+        self._policy = policy
+        self._expected_shape = (num_frames, image_size, image_size, 3)
+        self._image_keys = (left_image_key, right_image_key)
+        self._left_clip_key = left_clip_key
+        self._right_clip_key = right_clip_key
+
+    def create_session(self) -> "TactileClipPolicy":
+        return TactileClipPolicy(
+            self._policy.create_session() if hasattr(self._policy, "create_session") else self._policy,
+            num_frames=self._expected_shape[0],
+            image_size=self._expected_shape[1],
+            left_image_key=self._image_keys[0],
+            right_image_key=self._image_keys[1],
+            left_clip_key=self._left_clip_key,
+            right_clip_key=self._right_clip_key,
+        )
+
+    def _validate_clip(self, inputs: dict, key: str) -> None:
+        if key not in inputs:
+            raise ValueError(
+                f"Missing required AnyTouch tactile clip: {key}. "
+                f"The client must send both tactile clips with shape {self._expected_shape}."
+            )
+        clip = np.asarray(inputs[key])
+        if clip.dtype != np.uint8:
+            raise TypeError(f"{key} must have dtype uint8, got {clip.dtype}.")
+        if clip.shape != self._expected_shape:
+            raise ValueError(f"{key} must have shape {self._expected_shape}, got {clip.shape}.")
+        if not clip.flags.c_contiguous:
+            raise ValueError(f"{key} must be C-contiguous.")
+        inputs[key] = clip
+
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        inputs = dict(obs)
+        inputs.pop("reset", None)
+        inputs.pop("episode_reset", None)
+        unexpected_image_keys = [key for key in self._image_keys if key in inputs]
+        if unexpected_image_keys:
+            raise ValueError(
+                "AnyTouch serving accepts direct tactile clips only; remove single-frame tactile keys: "
+                f"{unexpected_image_keys}."
+            )
+        self._validate_clip(inputs, self._left_clip_key)
+        self._validate_clip(inputs, self._right_clip_key)
+
+        return self._policy.infer(inputs, noise=noise)
+
+    def reset(self) -> None:
+        reset = getattr(self._policy, "reset", None)
+        if reset is not None:
+            reset()
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._policy.metadata
+
 
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""
@@ -133,3 +210,11 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    def create_session(self) -> "PolicyRecorder":
+        session_policy = self._policy.create_session() if hasattr(self._policy, "create_session") else self._policy
+        return PolicyRecorder(session_policy, str(self._record_dir))
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._policy.metadata

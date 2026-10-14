@@ -3,7 +3,23 @@ import functools
 import logging
 import os
 import platform
+import re
 from typing import Any
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_triton_ptxas_dir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".venv",
+    "lib",
+    "python3.11",
+    "site-packages",
+    "triton",
+    "backends",
+    "nvidia",
+    "bin",
+)
+if os.path.isfile(os.path.join(_triton_ptxas_dir, "ptxas")):
+    os.environ["PATH"] = f"{_triton_ptxas_dir}:{os.environ.get('PATH', '')}"
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -144,15 +160,48 @@ def is_primary_process() -> bool:
 
 
 
-def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
+def _load_weights_and_validate(
+    loader: _weight_loaders.WeightLoader,
+    params_shape: at.Params,
+    *,
+    allow_missing_regex: str | None = None,
+) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    flat_expected = traverse_util.flatten_dict(params_shape)
+    flat_loaded_all = traverse_util.flatten_dict(loaded_params)
+    flat_loaded = {
+        key: value
+        for key, value in flat_loaded_all.items()
+        if not isinstance(value, jax.ShapeDtypeStruct)
+    }
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
-    return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
-    )
+    if allow_missing_regex is None:
+        at.check_pytree_equality(
+            expected=params_shape,
+            got=loaded_params,
+            check_shapes=True,
+            check_dtypes=True,
+        )
+    else:
+        missing = set(flat_expected) - set(flat_loaded_all)
+        unexpected = set(flat_loaded_all) - set(flat_expected)
+        missing_pattern = re.compile(allow_missing_regex)
+        invalid_missing = [key for key in missing if not missing_pattern.fullmatch("/".join(key))]
+        if invalid_missing or unexpected:
+            raise ValueError(
+                "Unexpected checkpoint parameter mismatch: "
+                f"invalid_missing={invalid_missing[:20]}, unexpected={list(unexpected)[:20]}"
+            )
+        expected_loaded = traverse_util.unflatten_dict({key: flat_expected[key] for key in flat_loaded_all})
+        at.check_pytree_equality(
+            expected=expected_loaded,
+            got=loaded_params,
+            check_shapes=True,
+            check_dtypes=True,
+        )
+
+    return traverse_util.unflatten_dict(flat_loaded)
 
 
 @at.typecheck
@@ -172,6 +221,11 @@ def init_train_state(
             # This will produce an error if the partial params are not a subset of the state.
             state.replace_by_pure_dict(partial_params)
             model = nnx.merge(graphdef, state)
+            if hasattr(model, "initialize_tactile_encoder_from_vision"):
+                loaded_paths = traverse_util.flatten_dict(partial_params)
+                tactile_loaded = any("tactile_img" in path for path in loaded_paths)
+                if not tactile_loaded:
+                    model.initialize_tactile_encoder_from_vision()
 
         params = nnx.state(model)
         # Convert frozen params to bfloat16.
@@ -193,7 +247,12 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    allow_missing_regex = ".*tactile_img.*" if getattr(config.model, "separate_tactile_encoder", False) else None
+    partial_params = _load_weights_and_validate(
+        config.weight_loader,
+        train_state_shape.params.to_pure_dict(),
+        allow_missing_regex=allow_missing_regex,
+    )
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.

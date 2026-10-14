@@ -5,6 +5,23 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import os
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+_triton_ptxas_dir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".venv",
+    "lib",
+    "python3.11",
+    "site-packages",
+    "triton",
+    "backends",
+    "nvidia",
+    "bin",
+)
+if os.path.isfile(os.path.join(_triton_ptxas_dir, "ptxas")):
+    os.environ["PATH"] = f"{_triton_ptxas_dir}:{os.environ.get('PATH', '')}"
+
 import numpy as np
 import tqdm
 import tyro

@@ -10,9 +10,8 @@ from transformers.models.clip.modeling_clip import CLIPVisionTransformer
 class TactileVideoMAE(nn.Module):
     """Minimal AnyTouch2 tactile VideoMAE encoder.
 
-    This is adapted from `/shareNFS_40/wyf/workplace/AnyTouch2/model/tactile_mae.py`
-    and kept local so OpenPI experiments do not depend on that repository being on
-    `PYTHONPATH`.
+    This is kept local so OpenPI experiments do not depend on the original
+    AnyTouch2 repository being on `PYTHONPATH`.
     """
 
     def __init__(self, config, num_frames: int = 4, stride: int = 2, mask_ratio: float = 0.0):

@@ -4,7 +4,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-from openpi.models_pytorch.anytouch2.tactile_mae import TactileVideoMAE, load_anytouch2_checkpoint
+from openpi.models_pytorch.anytouch2.tactile_mae import TactileVideoMAE
+from openpi.models_pytorch.anytouch2.tactile_mae import load_anytouch2_checkpoint
 
 
 class AnyTouch2TactileEncoder(nn.Module):
@@ -18,20 +19,24 @@ class AnyTouch2TactileEncoder(nn.Module):
         self,
         *,
         checkpoint_path: str | None,
+        random_init: bool = False,
         num_frames: int = 4,
         stride: int = 2,
         sensor_id: int = 0,
         trainable: bool = True,
+        projector_trainable: bool = True,
         keep_cls_sensor_tokens: bool = True,
         patch_tokens_per_side: int = 30,
         output_dim: int = 2048,
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        if checkpoint_path is None:
+        if random_init and checkpoint_path is not None:
+            raise ValueError("Random AnyTouch2 initialization cannot be combined with a checkpoint path.")
+        if checkpoint_path is None and not random_init:
             raise ValueError("AnyTouch2 requires `anytouch_checkpoint_path` in Pi0Config.")
-        checkpoint = Path(checkpoint_path).expanduser()
-        if not checkpoint.is_file():
+        checkpoint = Path(checkpoint_path).expanduser() if checkpoint_path is not None else None
+        if checkpoint is not None and not checkpoint.is_file():
             raise FileNotFoundError(
                 f"AnyTouch2 checkpoint not found: {checkpoint}. "
                 "Download or place the checkpoint there before using tactile_encoder_type='anytouch2'."
@@ -39,7 +44,8 @@ class AnyTouch2TactileEncoder(nn.Module):
 
         config_path = Path(__file__).parent / "configs" / "CLIP-B-16" / "config.json"
         self.encoder = TactileVideoMAE.from_config_path(str(config_path), num_frames=num_frames, stride=stride)
-        load_anytouch2_checkpoint(str(checkpoint), self.encoder)
+        if checkpoint is not None:
+            load_anytouch2_checkpoint(str(checkpoint), self.encoder)
 
         self.sensor_id = int(sensor_id)
         self.keep_cls_sensor_tokens = keep_cls_sensor_tokens
@@ -53,7 +59,9 @@ class AnyTouch2TactileEncoder(nn.Module):
 
         self.to(dtype=dtype)
         if not trainable:
-            self.requires_grad_(False)
+            self.encoder.requires_grad_(requires_grad=False)
+        if not projector_trainable:
+            self.projector.requires_grad_(requires_grad=False)
 
     def _prepare_clip(self, clip: torch.Tensor) -> torch.Tensor:
         if clip.ndim != 5:
@@ -101,8 +109,5 @@ class AnyTouch2TactileEncoder(nn.Module):
         tokens = self.encoder(clip, sensor_type=sensor_type)
         cls_and_sensor = tokens[:, :6]
         patch_tokens = self._compress_patch_tokens(tokens[:, 6:])
-        if self.keep_cls_sensor_tokens:
-            tokens = torch.cat([cls_and_sensor, patch_tokens], dim=1)
-        else:
-            tokens = patch_tokens
+        tokens = torch.cat([cls_and_sensor, patch_tokens], dim=1) if self.keep_cls_sensor_tokens else patch_tokens
         return self.projector(tokens.to(dtype=self.projector.weight.dtype))

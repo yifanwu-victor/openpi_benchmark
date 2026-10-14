@@ -34,7 +34,7 @@ dependencies = [
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
-    "wandb>=0.19.1",
+    "wandb==0.28.2",
     "filelock>=3.16.1",
     "beartype==0.19.0",
     "treescope>=0.1.7",
@@ -63,6 +63,11 @@ override-dependencies = [
     "tensorstore==0.1.74",
     "torch==2.12.0.dev20260408+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128-nightly"

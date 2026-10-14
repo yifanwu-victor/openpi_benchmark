@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${REPO_ROOT:-/home/tione/notebook/openpi_benchmark}"
+export REPO_ROOT="$ROOT" GPU_IDS="${GPU_IDS:-4,5,6,7}" NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+COMMON="$ROOT/scripts/train/anytouch_action_expert/train_sim_abs_joint_anytouch2_action_expert_full_ft.sh"
+run_task() { local config="$1" exp="$2" raw="$3" repo="$4" source="$5"; CONFIG_NAME="$config" EXP_NAME="$exp" HDF5_DIR="$raw" REPO_ID="$repo" NORM_STATS_FILE="$ROOT/assets/$config/$repo/norm_stats.json" NORM_STATS_SOURCE_FILE="$source" NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-10000}" bash "$COMMON" "$@"; }
+run_task "${PULL_DRAWER_CONFIG_NAME:-pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_anytouch2_action_expert_torch_full_ft}" "${PULL_DRAWER_EXP_NAME:-pull_drawer_anytouch2_action_expert_torch_full_ft_v1}" "${PULL_DRAWER_HDF5_DIR:-/home/tione/notebook/data/UniVTAC/sim/pull_drawer}" "${PULL_DRAWER_REPO_ID:-simulation/pull_drawer_gelsight_abs_joint}" "${PULL_DRAWER_NORM_STATS_SOURCE_FILE:-$ROOT/assets/pi05_pull_drawer_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft/simulation/pull_drawer_gelsight_abs_joint/norm_stats.json}"
+run_task "${TURN_GEAR_CONFIG_NAME:-pi05_turn_gear_pair_sim_abs_joint_relative_action_vision_tactile_anytouch2_action_expert_torch_full_ft}" "${TURN_GEAR_EXP_NAME:-turn_gear_pair_anytouch2_action_expert_torch_full_ft_v1}" "${TURN_GEAR_HDF5_DIR:-/home/tione/notebook/data/UniVTAC/sim/turn_gear_pair}" "${TURN_GEAR_REPO_ID:-simulation/turn_gear_pair_gelsight_abs_joint}" "${TURN_GEAR_NORM_STATS_SOURCE_FILE:-$ROOT/assets/pi05_turn_gear_pair_sim_abs_joint_relative_action_vision_tactile_anytouch2_random_torch_full_ft/simulation/turn_gear_pair_gelsight_abs_joint/norm_stats.json}"
